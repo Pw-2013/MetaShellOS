@@ -2884,22 +2884,1737 @@ static void systemLogViewerApp(void)
 static void userManagerApp(void)
 {char b[256],why[128];for(;;){UserDb db;appHeader("User Manager");if(dbLoad(&db)>=0){for(size_t i=0;i<db.count;i++)if(db.items[i].kind!=U_INVALID)printf("  %-24s %s\n",db.items[i].name,ciEqual(db.items[i].name,os.user)?"(active)":"");dbFree(&db);}printf("\n  a Add account   r Rename active account   d Delete account   q Back\n");if(readLine("  > ",b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(b[0]=='a'){createAccount();}else if(b[0]=='r'){printf("  Use Settings to rename the active account.\n");}else if(b[0]=='d'){char u[64];if(readLine("  Username to delete: ",u,sizeof u)!=IN_OK||ciEqual(trim(u),os.user))continue;if(confirm("Delete this account?")){UserDb x;if(dbLoad(&x)==0){UserRec*r=dbFind(&x,trim(u));if(r){memmove(r,r+1,(x.count-(size_t)(r-x.items)-1)*sizeof *r);x.count--;dbSave(&x);appLog("USERS","deleted account %s",u);}dbFree(&x);}}} (void)why;}}
 static void helpCentreApp(void)
-{char b[160];for(;;){appHeader("Help Centre");printf("\n  MetaDOS keeps user data in the working directory.\n  File Manager manages files without launching host programs.\n  Terminal runs built-in commands only.\n  Text Editor uses :w to save and :q to leave.\n  Browser fetches real HTTP/HTTPS pages with libcurl and renders readable HTML text.\n  Backup Manager copies notes, tasks, events, logs and notifications.\n\n  Search help (optional) or q to return: ");if(readLine(NULL,b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(*trim(b))printf("\n  Search results for '%s': see the matching application help above.\n",trim(b));appBackPrompt();}}
+{char b[160];for(;;){appHeader("Help Centre");printf("\n  MetaDOS keeps user data in the working directory.\n  File Manager manages files without launching host programs.\n  Terminal runs built-in commands only.\n  Text Editor uses :w to save and :q to leave.\n  Browser opens real HTTP/HTTPS pages: numbered links, back/forward, reload,\n  search, bookmarks and history, rendered as readable text.\n  Backup Manager copies notes, tasks, events, logs and notifications.\n\n  Search help (optional) or q to return: ");if(readLine(NULL,b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(*trim(b))printf("\n  Search results for '%s': see the matching application help above.\n",trim(b));appBackPrompt();}}
 static void notificationCentreApp(void)
 {char b[32];for(;;){appHeader("Notification Centre");if(viewTextFile("notifications.log",0)!=0)printf("\n  No notifications.\n");printf("\n  d dismiss all   q back\n");if(readLine("  > ",b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(b[0]=='d'&&confirm("Dismiss all notifications?")){remove("notifications.log");setNotice(ST_GOOD,"Notifications dismissed.");}}}
 
+/* ================= META DOS BROWSER ================= */
+
+/*
+ * A text-mode web browser. libcurl fetches the page; the HTML is flattened into
+ * word-wrapped readable text and every hyperlink is numbered, so links can be
+ * followed from the keyboard. Back/forward, reload, search, bookmarks and
+ * history work without a mouse or a graphics stack. There is no JavaScript
+ * engine: this is a reader, not a rendering engine.
+ */
+
 #ifdef HAVE_CURL
-struct CurlBuffer { char *p; size_t n, cap; };
-static size_t browserWrite(void *ptr,size_t sz,size_t nm,void *ud){struct CurlBuffer*b=ud;size_t n=sz*nm;if(b->n+n>MAX_VIEW_BYTES)return 0;if(b->n+n+1>b->cap){size_t c=b->cap?b->cap*2:8192;while(c<b->n+n+1)c*=2;b->p=realloc(b->p,c);if(!b->p)return 0;b->cap=c;}memcpy(b->p+b->n,ptr,n);b->n+=n;b->p[b->n]='\0';return n;}
-static void browserText(const char *html){int tag=0,space=0;const char*p;for(p=html;*p;p++){if(*p=='<'){tag=1;continue;}if(tag){if(*p=='>'){tag=0;putchar(' ');space=1;}continue;}if(isspace((unsigned char)*p)){if(!space){putchar(' ');space=1;}}else{putchar(*p);space=0;}}putchar('\n');}
-#endif
+
+#define BROWSER_COLS       78           /* wrapped text width, in columns   */
+#define BROWSER_LINES      14           /* page lines shown per screen      */
+#define BROWSER_MAX_TEXT   (512 * 1024) /* rendered text cap                */
+#define BROWSER_MAX_LINKS  300          /* link table per page              */
+#define BROWSER_HISTORY    "browser_history.txt"
+#define BROWSER_BOOKMARKS  "browser_bookmarks.txt"
+#define BROWSER_UA \
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " \
+    "MetaDOS-Browser/2.0 Safari/537.36"
+
+static char browserError[200];
+
+/* ---- growable byte buffer ---- */
+
+typedef struct { char *p; size_t n, cap; int oom; } BBuf;
+
+static void bbInit(BBuf *b) { b->p = NULL; b->n = b->cap = 0; b->oom = 0; }
+static void bbFree(BBuf *b) { free(b->p); bbInit(b); }
+
+static int bbReserve(BBuf *b, size_t extra)
+{
+    size_t cap;
+    char *np;
+    if (b->oom) return -1;
+    if (b->n + extra + 1 <= b->cap) return 0;
+    cap = b->cap ? b->cap : 4096;
+    while (cap < b->n + extra + 1) cap *= 2;
+    np = (char *)realloc(b->p, cap);
+    if (!np) { b->oom = 1; return -1; }
+    b->p = np;
+    b->cap = cap;
+    return 0;
+}
+
+static void bbPut(BBuf *b, const char *s, size_t n)
+{
+    if (bbReserve(b, n) != 0) return;
+    if (n) memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+
+static void bbPuts(BBuf *b, const char *s) { bbPut(b, s, strlen(s)); }
+static void bbChar(BBuf *b, char c) { bbPut(b, &c, 1); }
+
+static char *msDup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+/* ---- small string helpers ---- */
+
+static int ciPrefix(const char *s, const char *prefix)
+{
+    while (*prefix) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return 0;
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+static const char *findCI(const char *hay, size_t n, const char *needle)
+{
+    size_t nl = strlen(needle), i;
+    if (nl == 0 || n < nl) return NULL;
+    for (i = 0; i + nl <= n; i++)
+        if (ciPrefix(hay + i, needle)) return hay + i;
+    return NULL;
+}
+
+/* Truncate to at most `maxcols` visible columns, marking the cut with "...". */
+static void truncCols(char *dst, size_t dsz, const char *src, int maxcols)
+{
+    int seen = 0;
+    size_t o = 0;
+    const char *p = src;
+    if (dsz == 0) return;
+    while (*p) {
+        size_t l = 1;
+        while (((unsigned char)p[l] & 0xC0) == 0x80) l++;
+        if (maxcols > 4 && seen + 3 >= maxcols) {
+            if (o + 4 < dsz) { memcpy(dst + o, "...", 3); o += 3; }
+            break;
+        }
+        if (o + l + 1 >= dsz) break;
+        memcpy(dst + o, p, l);
+        o += l;
+        p += l;
+        seen++;
+    }
+    dst[o] = '\0';
+}
+
+/* ---- UTF-8 helpers ---- */
+
+static int u8Len(const char *s, size_t avail)
+{
+    unsigned char c = (unsigned char)*s;
+    int n = 1;
+    if (c >= 0xF0) n = 4;
+    else if (c >= 0xE0) n = 3;
+    else if (c >= 0xC0) n = 2;
+    if ((size_t)n > avail) n = 1;
+    return n;
+}
+
+static int u8Count(const char *s, size_t n)
+{
+    size_t i = 0;
+    int c = 0;
+    while (i < n) { i += (size_t)u8Len(s + i, n - i); c++; }
+    return c;
+}
+
+static int utf8Encode(unsigned cp, char *out)
+{
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    if (cp < 0x110000) {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+/* ---- character entities ---- */
+
+static const struct { const char *name, *rep; } ENTITIES[] = {
+    { "amp", "&" }, { "lt", "<" }, { "gt", ">" }, { "quot", "\"" }, { "apos", "'" },
+    { "nbsp", " " }, { "copy", "\xC2\xA9" }, { "reg", "\xC2\xAE" },
+    { "trade", "\xE2\x84\xA2" }, { "mdash", "\xE2\x80\x94" }, { "ndash", "\xE2\x80\x93" },
+    { "hellip", "\xE2\x80\xA6" }, { "lsquo", "\xE2\x80\x98" }, { "rsquo", "\xE2\x80\x99" },
+    { "ldquo", "\xE2\x80\x9C" }, { "rdquo", "\xE2\x80\x9D" }, { "laquo", "\xC2\xAB" },
+    { "raquo", "\xC2\xBB" }, { "bull", "\xE2\x80\xA2" }, { "middot", "\xC2\xB7" },
+    { "deg", "\xC2\xB0" }, { "euro", "\xE2\x82\xAC" }, { "pound", "\xC2\xA3" },
+    { "yen", "\xC2\xA5" }, { "cent", "\xC2\xA2" }, { "times", "\xC3\x97" },
+    { "divide", "\xC3\xB7" }, { "plusmn", "\xC2\xB1" }, { "frac12", "\xC2\xBD" },
+    { "larr", "\xE2\x86\x90" }, { "rarr", "\xE2\x86\x92" }, { "uarr", "\xE2\x86\x91" },
+    { "darr", "\xE2\x86\x93" }, { "check", "\xE2\x9C\x93" }, { "shy", "" },
+    { NULL, NULL }
+};
+
+/* If `s` starts with a character entity, append its text and return the number
+ * of input bytes consumed; returns 0 when this is not an entity. */
+static size_t emitEntity(const char *s, size_t n, BBuf *out)
+{
+    size_t i;
+    if (n < 3 || s[0] != '&') return 0;
+    for (i = 1; i < n && i < 12 && s[i] != ';'; i++)
+        ;
+    if (i >= n || s[i] != ';' || i < 2) return 0;
+
+    if (s[1] == '#') {
+        unsigned long cp = 0;
+        int hex = (s[2] == 'x' || s[2] == 'X');
+        size_t j = hex ? 3 : 2;
+        char enc[4];
+        int len;
+        if (j >= i) return 0;
+        for (; j < i; j++) {
+            int d;
+            unsigned char c = (unsigned char)s[j];
+            if (hex && isdigit(c)) d = c - '0';
+            else if (hex && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (hex && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else if (!hex && isdigit(c)) d = c - '0';
+            else return 0;
+            cp = cp * (hex ? 16u : 10u) + (unsigned long)d;
+            if (cp > 0x10FFFFul) return 0;
+        }
+        len = utf8Encode((unsigned)cp, enc);
+        if (len > 0) bbPut(out, enc, (size_t)len);
+        return i + 1;
+    }
+    {
+        char name[12];
+        size_t l = i - 1, k;
+        if (l >= sizeof name) return 0;
+        memcpy(name, s + 1, l);
+        name[l] = '\0';
+        for (k = 0; ENTITIES[k].name; k++) {
+            if (!strcmp(name, ENTITIES[k].name)) {
+                bbPuts(out, ENTITIES[k].rep);
+                return i + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Copy text, decoding entities and dropping terminal control characters so a
+ * hostile page cannot drive the terminal. */
+static void decodeText(BBuf *out, const char *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '&') {
+            size_t used = emitEntity(s + i, n - i, out);
+            if (used) { i += used; continue; }
+        }
+        if ((c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7F) { i++; continue; }
+        bbChar(out, (char)c);
+        i++;
+    }
+}
+
+static void decodeInto(char *dst, size_t dsz, const char *s, size_t n)
+{
+    BBuf b;
+    bbInit(&b);
+    decodeText(&b, s, n);
+    if (b.p) safeCopy(dst, dsz, b.p);
+    else if (dsz) dst[0] = '\0';
+    bbFree(&b);
+}
+
+/* ---- page model ---- */
+
+typedef struct {
+    char *text;                 /* rendered, wrapped page text              */
+    char **links;               /* unique link targets, numbered from 1     */
+    int linkCount, linkCap;
+    char url[MS_PATH_MAX];      /* effective URL after redirects            */
+    char title[160];
+    char host[128];
+    char type[64];
+    long status;
+} BrowserPage;
+
+static void pageFree(BrowserPage *pg)
+{
+    int i;
+    free(pg->text);
+    for (i = 0; i < pg->linkCount; i++) free(pg->links[i]);
+    free(pg->links);
+    memset(pg, 0, sizeof *pg);
+}
+
+static int pageAddLink(BrowserPage *pg, const char *url)
+{
+    int i;
+    char *copy;
+    for (i = 0; i < pg->linkCount; i++)
+        if (!strcmp(pg->links[i], url)) return i + 1;
+    if (pg->linkCount >= BROWSER_MAX_LINKS) return 0;
+    if (pg->linkCount == pg->linkCap) {
+        int nc = pg->linkCap ? pg->linkCap * 2 : 32;
+        char **np = (char **)realloc(pg->links, (size_t)nc * sizeof *np);
+        if (!np) return 0;
+        pg->links = np;
+        pg->linkCap = nc;
+    }
+    copy = msDup(url);
+    if (!copy) return 0;
+    pg->links[pg->linkCount++] = copy;
+    return pg->linkCount;
+}
+
+/* ---- URL handling ---- */
+
+/* Collapse "." and ".." segments in a path (query/fragment already removed). */
+static void normalizePathOnly(const char *in, char *out, size_t osz)
+{
+    const char *s = in;
+    size_t o = 0;
+    if (osz < 2) { if (osz) out[0] = '\0'; return; }
+    out[0] = '\0';
+    while (*s == '/') s++;
+    while (*s) {
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        if (e - s == 1 && s[0] == '.') {
+            /* current directory: drop */
+        } else if (e - s == 2 && s[0] == '.' && s[1] == '.') {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            out[o] = '\0';
+        } else if (e > s) {
+            if (o + (size_t)(e - s) + 2 < osz) {
+                out[o++] = '/';
+                memcpy(out + o, s, (size_t)(e - s));
+                o += (size_t)(e - s);
+                out[o] = '\0';
+            }
+        }
+        s = e;
+        while (*s == '/') s++;
+    }
+    if (o == 0) { out[0] = '/'; out[1] = '\0'; }
+}
+
+static void browserNormalizeUrl(const char *url, char *out, size_t osz)
+{
+    const char *sep = strstr(url, "://");
+    char scheme[16], auth[256], path[MS_PATH_MAX * 2], query[MS_PATH_MAX], norm[MS_PATH_MAX * 2];
+    size_t sl, al;
+    const char *q;
+    char *m;
+
+    if (!sep) { safeCopy(out, osz, url); return; }
+    sl = (size_t)(sep - url);
+    if (sl >= sizeof scheme) sl = sizeof scheme - 1;
+    memcpy(scheme, url, sl);
+    scheme[sl] = '\0';
+    q = sep + 3;
+    al = strcspn(q, "/?#");
+    if (al >= sizeof auth) al = sizeof auth - 1;
+    memcpy(auth, q, al);
+    auth[al] = '\0';
+    safeCopy(path, sizeof path, q + al);
+
+    query[0] = '\0';
+    m = path + strcspn(path, "?#");
+    if (*m) {
+        safeCopy(query, sizeof query, m);
+        *m = '\0';
+    }
+    normalizePathOnly(path, norm, sizeof norm);
+    snprintf(out, osz, "%s://%s%s%s", scheme, auth, norm, query);
+}
+
+static void browserResolve(const char *base, const char *href, char *out, size_t osz)
+{
+    char scheme[16] = "", auth[256] = "", path[MS_PATH_MAX] = "", cand[MS_PATH_MAX * 3];
+    const char *sep, *q, *hash, *quest;
+    size_t sl, al, dl;
+
+    sep = strstr(base, "://");
+    if (sep) {
+        sl = (size_t)(sep - base);
+        if (sl >= sizeof scheme) sl = sizeof scheme - 1;
+        memcpy(scheme, base, sl);
+        scheme[sl] = '\0';
+        q = sep + 3;
+        al = strcspn(q, "/?#");
+        if (al >= sizeof auth) al = sizeof auth - 1;
+        memcpy(auth, q, al);
+        auth[al] = '\0';
+        safeCopy(path, sizeof path, q + al);
+    } else {
+        safeCopy(path, sizeof path, base);
+    }
+
+    if (strstr(href, "://")) {
+        browserNormalizeUrl(href, out, osz);
+        return;
+    }
+    if (href[0] == '/' && href[1] == '/' && scheme[0]) {
+        snprintf(cand, sizeof cand, "%s:%s", scheme, href);
+        browserNormalizeUrl(cand, out, osz);
+        return;
+    }
+    if (!scheme[0]) { safeCopy(out, osz, href); return; }
+
+    if (href[0] == '#') {
+        hash = strchr(path, '#');
+        dl = hash ? (size_t)(hash - path) : strlen(path);
+        snprintf(cand, sizeof cand, "%s://%s%.*s%s", scheme, auth, (int)dl, path, href);
+        safeCopy(out, osz, cand);
+        return;
+    }
+    if (href[0] == '?') {
+        quest = strpbrk(path, "?#");
+        dl = quest ? (size_t)(quest - path) : strlen(path);
+        snprintf(cand, sizeof cand, "%s://%s%.*s%s", scheme, auth, (int)dl, path, href);
+        safeCopy(out, osz, cand);
+        return;
+    }
+    if (href[0] == '/') {
+        snprintf(cand, sizeof cand, "%s://%s%s", scheme, auth, href);
+        browserNormalizeUrl(cand, out, osz);
+        return;
+    }
+    {
+        const char *last = NULL, *s;
+        for (s = path; *s && *s != '?' && *s != '#'; s++)
+            if (*s == '/') last = s;
+        if (!last) snprintf(cand, sizeof cand, "%s://%s/%s", scheme, auth, href);
+        else {
+            size_t dl2 = (size_t)(last - path) + 1;
+            snprintf(cand, sizeof cand, "%s://%s%.*s%s", scheme, auth, (int)dl2, path, href);
+        }
+    }
+    browserNormalizeUrl(cand, out, osz);
+}
+
+static void browserSearch(const char *terms, char *out, size_t osz)
+{
+    CURL *c = curl_easy_init();
+    char *esc = c ? curl_easy_escape(c, terms, 0) : NULL;
+    snprintf(out, osz, "https://www.bing.com/search?q=%s", esc ? esc : "");
+    if (esc) curl_free(esc);
+    if (c) curl_easy_cleanup(c);
+}
+
+/* Turn what the user typed into a URL: an address stays an address, a bare
+ * domain gets https://, and anything else becomes a web search. */
+static void browserNormalizeInput(const char *raw, char *out, size_t osz)
+{
+    char t[MS_PATH_MAX];
+    char *v;
+    int local;
+
+    safeCopy(t, sizeof t, raw);
+    v = trim(t);
+    if (!*v) { safeCopy(out, osz, "https://example.com/"); return; }
+    if (strstr(v, "://")) { safeCopy(out, osz, v); return; }
+    if (v[0] == '/' && v[1] == '/') { snprintf(out, osz, "https:%s", v); return; }
+    if (strpbrk(v, " \t")) { browserSearch(v, out, osz); return; }
+    if (!strchr(v, '.') && !strchr(v, ':')) { browserSearch(v, out, osz); return; }
+    local = ciPrefix(v, "localhost") || !strncmp(v, "127.", 4) || !strncmp(v, "192.168.", 8);
+    snprintf(out, osz, "%s://%s", local ? "http" : "https", v);
+}
+
+/* ---- HTML to text renderer ---- */
+
+typedef struct {
+    BBuf out;
+    int col;
+    int indent;
+    int pendingNL;      /* 0 none, 1 new line, 2 blank line */
+    int space;
+    int pre;
+    int linkOpen;
+    int linkNo;
+    int anchorText;
+    int olDepth;
+    int olNext[4];
+    int truncated;
+} Render;
+
+static void rIndent(Render *r)
+{
+    int i;
+    for (i = 0; i < r->indent && r->col < BROWSER_COLS; i++) {
+        bbChar(&r->out, ' ');
+        r->col++;
+    }
+}
+
+static void rWrap(Render *r)
+{
+    bbChar(&r->out, '\n');
+    r->col = 0;
+    r->space = 0;
+    rIndent(r);
+}
+
+static void rFlush(Render *r)
+{
+    if (!r->pendingNL) return;
+    while (r->pendingNL > 0) {
+        bbChar(&r->out, '\n');
+        r->pendingNL--;
+    }
+    r->col = 0;
+    r->space = 0;
+    rIndent(r);
+}
+
+static void rBreak(Render *r, int lines)
+{
+    if (r->out.n == 0) return;
+    if (lines > 2) lines = 2;
+    if (r->pendingNL < lines) r->pendingNL = lines;
+    r->space = 0;
+}
+
+static void rWord(Render *r, const char *w, size_t n)
+{
+    int wl;
+    size_t i = 0;
+
+    if (n == 0 || r->out.n >= BROWSER_MAX_TEXT) return;
+    wl = u8Count(w, n);
+    rFlush(r);
+    if (r->space) {
+        if (r->col > r->indent && r->col + 1 + wl > BROWSER_COLS) rWrap(r);
+        else { bbChar(&r->out, ' '); r->col++; }
+        r->space = 0;
+    }
+    if (r->col > r->indent && r->col + wl > BROWSER_COLS) rWrap(r);
+    while (i < n) {
+        int len;
+        if (r->col >= BROWSER_COLS) rWrap(r);
+        len = u8Len(w + i, n - i);
+        bbPut(&r->out, w + i, (size_t)len);
+        r->col++;
+        i += (size_t)len;
+    }
+}
+
+static void rText(Render *r, const char *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        if (isspace((unsigned char)s[i])) {
+            r->space = 1;
+            i++;
+            continue;
+        }
+        {
+            size_t j = i;
+            while (j < n && !isspace((unsigned char)s[j])) j++;
+            rWord(r, s + i, j - i);
+            i = j;
+        }
+    }
+}
+
+/* Preformatted text: keep spaces and line breaks, wrap only when a line is
+ * wider than the page. */
+static void rPreText(Render *r, const char *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        char c = s[i];
+        if (c == '\n') {
+            r->pendingNL = 0;
+            bbChar(&r->out, '\n');
+            r->col = 0;
+            i++;
+            continue;
+        }
+        if (c == '\r') { i++; continue; }
+        if (c == '\t') {
+            int k;
+            for (k = 0; k < 4; k++) {
+                if (r->col >= BROWSER_COLS) {
+                    bbChar(&r->out, '\n');
+                    r->col = 0;
+                }
+                bbChar(&r->out, ' ');
+                r->col++;
+            }
+            i++;
+            continue;
+        }
+        {
+            int len = u8Len(s + i, n - i);
+            if (r->col >= BROWSER_COLS) {
+                bbChar(&r->out, '\n');
+                r->col = 0;
+            }
+            bbPut(&r->out, s + i, (size_t)len);
+            r->col++;
+            i += (size_t)len;
+        }
+    }
+}
+
+static void rMarker(Render *r, int no)
+{
+    char m[16];
+    if (no <= 0) return;
+    snprintf(m, sizeof m, "[%d]", no);
+    r->space = 1;
+    rWord(r, m, strlen(m));
+}
+
+static void emitHtmlText(Render *r, const char *s, size_t n)
+{
+    BBuf b;
+    size_t i;
+
+    bbInit(&b);
+    decodeText(&b, s, n);
+    if (!b.p) { bbFree(&b); return; }
+    if (r->pre) rPreText(r, b.p, b.n);
+    else rText(r, b.p, b.n);
+    if (r->linkOpen && !r->anchorText) {
+        for (i = 0; i < b.n; i++)
+            if (!isspace((unsigned char)b.p[i])) { r->anchorText = 1; break; }
+    }
+    bbFree(&b);
+}
+
+static const char *const SKIP_TAGS[] = {
+    "script", "style", "head", "noscript", "svg", "template", "iframe",
+    "object", "canvas", "select", NULL
+};
+static const char *const BLOCK2_TAGS[] = {
+    "p", "pre", "blockquote", "ul", "ol", "table", "hr", "section", "article",
+    "main", "header", "footer", "aside", "nav", "figure", "dl", "form",
+    "fieldset", "address", NULL
+};
+static const char *const BLOCK1_TAGS[] = {
+    "div", "tr", "td", "th", "dt", "dd", "br", "figcaption", "tbody", "thead",
+    "tfoot", "caption", "details", "summary", NULL
+};
+
+static int tagIn(const char *name, const char *const *list)
+{
+    for (; *list; list++)
+        if (!strcmp(name, *list)) return 1;
+    return 0;
+}
+
+/* Skip the body of an element we do not render, e.g. <script>...</script>. */
+static const char *skipElement(const char *p, const char *end, const char *name)
+{
+    char close[24];
+    size_t cl;
+    snprintf(close, sizeof close, "</%s", name);
+    cl = strlen(close);
+    while (p < end) {
+        if (*p == '<' && (size_t)(end - p) > cl && ciPrefix(p, close)) {
+            p += cl;
+            while (p < end && *p != '>') p++;
+            return p < end ? p + 1 : end;
+        }
+        p++;
+    }
+    return end;
+}
+
+static void parseTagAttrs(const char **qp, const char *end, char *href, size_t hsz,
+                          char *alt, size_t asz)
+{
+    const char *q = *qp;
+    while (q < end && *q != '>') {
+        char an[24];
+        size_t anl = 0;
+        char *dst = NULL;
+        size_t dsz = 0;
+
+        while (q < end && isspace((unsigned char)*q)) q++;
+        if (q >= end || *q == '>') break;
+        if (*q == '/') { q++; continue; }
+        while (q < end && !isspace((unsigned char)*q) && *q != '=' && *q != '>' &&
+               anl + 1 < sizeof an)
+            an[anl++] = (char)tolower((unsigned char)*q++);
+        an[anl] = '\0';
+        while (q < end && isspace((unsigned char)*q)) q++;
+        if (q < end && *q == '=') {
+            const char *v;
+            size_t vn;
+            q++;
+            while (q < end && isspace((unsigned char)*q)) q++;
+            if (q < end && (*q == '"' || *q == '\'')) {
+                char quote = *q++;
+                v = q;
+                while (q < end && *q != quote) q++;
+                vn = (size_t)(q - v);
+                if (q < end) q++;
+            } else {
+                v = q;
+                while (q < end && !isspace((unsigned char)*q) && *q != '>') q++;
+                vn = (size_t)(q - v);
+            }
+            if (!strcmp(an, "href")) { dst = href; dsz = hsz; }
+            else if (!strcmp(an, "alt")) { dst = alt; dsz = asz; }
+            if (dst) decodeInto(dst, dsz, v, vn);
+        }
+    }
+    *qp = q;
+}
+
+static void applyTag(Render *r, BrowserPage *pg, const char *name, int closing,
+                     const char *href, const char *alt)
+{
+    if (!strcmp(name, "a")) {
+        if (closing) {
+            if (r->linkOpen) {
+                if (r->anchorText && r->linkNo > 0) {
+                    int keep = r->pendingNL;
+                    r->pendingNL = 0;
+                    rMarker(r, r->linkNo);
+                    if (r->pendingNL < keep) r->pendingNL = keep;
+                }
+                r->linkOpen = 0;
+                r->linkNo = 0;
+                r->anchorText = 0;
+            }
+        } else if (href[0] && !ciPrefix(href, "javascript:") && !ciPrefix(href, "mailto:")) {
+            char abs[MS_PATH_MAX];
+            browserResolve(pg->url, href, abs, sizeof abs);
+            if (abs[0]) {
+                int no = pageAddLink(pg, abs);
+                if (no > 0) {
+                    r->linkNo = no;
+                    r->linkOpen = 1;
+                    r->anchorText = 0;
+                }
+            }
+        }
+        return;
+    }
+
+    if (!strcmp(name, "h1") || !strcmp(name, "h2") || !strcmp(name, "h3") ||
+        !strcmp(name, "h4") || !strcmp(name, "h5") || !strcmp(name, "h6")) {
+        if (closing) { rBreak(r, 1); return; }
+        rBreak(r, 2);
+        if (name[1] == '1') rWord(r, "#", 1);
+        else if (name[1] == '2') rWord(r, "##", 2);
+        else rWord(r, "###", 3);
+        r->space = 1;
+        return;
+    }
+
+    if (!strcmp(name, "li")) {
+        char bullet[16];
+        if (closing) { rBreak(r, 1); return; }
+        rBreak(r, 1);
+        if (r->olDepth > 0) {
+            snprintf(bullet, sizeof bullet, "%d.", r->olNext[r->olDepth - 1]);
+            if (r->olNext[r->olDepth - 1] < 9999) r->olNext[r->olDepth - 1]++;
+        } else {
+            safeCopy(bullet, sizeof bullet, "-");
+        }
+        rWord(r, bullet, strlen(bullet));
+        r->space = 1;
+        return;
+    }
+
+    if (!strcmp(name, "ul")) {
+        if (closing) {
+            if (r->indent >= 2) r->indent -= 2;
+            rBreak(r, 1);
+        } else {
+            rBreak(r, 2);
+            r->indent += 2;
+        }
+        return;
+    }
+    if (!strcmp(name, "ol")) {
+        if (closing) {
+            if (r->olDepth > 0) r->olDepth--;
+            if (r->indent >= 2) r->indent -= 2;
+            rBreak(r, 1);
+        } else {
+            rBreak(r, 2);
+            if (r->olDepth < 4) {
+                r->olNext[r->olDepth] = 1;
+                r->olDepth++;
+            }
+            r->indent += 2;
+        }
+        return;
+    }
+    if (!strcmp(name, "blockquote")) {
+        if (closing) {
+            if (r->indent >= 2) r->indent -= 2;
+            rBreak(r, 2);
+        } else {
+            rBreak(r, 2);
+            r->indent += 2;
+        }
+        return;
+    }
+    if (!strcmp(name, "pre")) {
+        if (closing) {
+            r->pre = 0;
+            if (r->col > 0) { bbChar(&r->out, '\n'); r->col = 0; }
+            rBreak(r, 2);
+        } else {
+            rBreak(r, 2);
+            rFlush(r);
+            r->pre = 1;
+        }
+        return;
+    }
+    if (!strcmp(name, "br")) { rBreak(r, 1); return; }
+    if (!strcmp(name, "hr")) {
+        int i;
+        rBreak(r, 2);
+        rFlush(r);
+        for (i = 0; i < 46; i++) bbChar(&r->out, '-');
+        bbChar(&r->out, '\n');
+        r->col = 0;
+        rBreak(r, 2);
+        return;
+    }
+    if (!strcmp(name, "img")) {
+        if (!closing && alt[0]) {
+            char buf[240];
+            snprintf(buf, sizeof buf, "[image: %s]", alt);
+            r->space = 1;
+            rWord(r, buf, strlen(buf));
+            if (r->linkOpen) r->anchorText = 1;
+        }
+        return;
+    }
+    if (tagIn(name, BLOCK2_TAGS)) { if (closing) rBreak(r, 1); else rBreak(r, 2); return; }
+    if (tagIn(name, BLOCK1_TAGS)) { rBreak(r, 1); return; }
+}
+
+/* Strip trailing spaces and collapse runs of blank lines. */
+static void cleanText(BBuf *b)
+{
+    size_t i, o = 0;
+    int nl = 0;
+    if (!b->p) return;
+    for (i = 0; i < b->n; i++) {
+        char c = b->p[i];
+        if (c == '\n') {
+            while (o > 0 && b->p[o - 1] == ' ') o--;
+            nl++;
+            if (nl > 2) continue;
+            b->p[o++] = '\n';
+        } else if (c == '\r') {
+            continue;
+        } else {
+            nl = 0;
+            b->p[o++] = c;
+        }
+    }
+    while (o > 0 && (b->p[o - 1] == '\n' || b->p[o - 1] == ' ')) o--;
+    if (o) b->p[o++] = '\n';
+    b->p[o] = '\0';
+    b->n = o;
+}
+
+static void renderHtml(BrowserPage *pg, const char *html, size_t len)
+{
+    Render r;
+    const char *p = html, *end = html + len;
+
+    memset(&r, 0, sizeof r);
+    bbInit(&r.out);
+
+    while (p < end && r.out.n < BROWSER_MAX_TEXT) {
+        if (*p != '<') {
+            const char *q = p;
+            while (q < end && *q != '<') q++;
+            emitHtmlText(&r, p, (size_t)(q - p));
+            p = q;
+            continue;
+        }
+        if (p + 3 < end && p[1] == '!' && p[2] == '-' && p[3] == '-') {
+            const char *q = p + 4;
+            while (q + 2 < end && !(q[0] == '-' && q[1] == '-' && q[2] == '>')) q++;
+            p = (q + 2 < end) ? q + 3 : end;
+            continue;
+        }
+        if (p + 1 < end && (p[1] == '!' || p[1] == '?')) {
+            const char *q = p + 1;
+            while (q < end && *q != '>') q++;
+            p = (q < end) ? q + 1 : end;
+            continue;
+        }
+        {
+            const char *q = p + 1;
+            char name[16], href[MS_PATH_MAX], alt[200];
+            size_t nl = 0;
+            int closing = 0;
+
+            href[0] = '\0';
+            alt[0] = '\0';
+            if (q < end && *q == '/') { closing = 1; q++; }
+            while (q < end && isspace((unsigned char)*q)) q++;
+            while (q < end && nl + 1 < sizeof name &&
+                   (isalnum((unsigned char)*q) || *q == ':' || *q == '-'))
+                name[nl++] = (char)tolower((unsigned char)*q++);
+            name[nl] = '\0';
+            parseTagAttrs(&q, end, href, sizeof href, alt, sizeof alt);
+            p = (q < end) ? q + 1 : end;
+
+            if (!closing && tagIn(name, SKIP_TAGS)) {
+                p = skipElement(p, end, name);
+                continue;
+            }
+            applyTag(&r, pg, name, closing, href, alt);
+        }
+    }
+
+    rFlush(&r);
+    if (r.truncated || r.out.n >= BROWSER_MAX_TEXT)
+        bbPuts(&r.out, "\n[Page truncated: too large to display]\n");
+    cleanText(&r.out);
+    pg->text = r.out.p;
+    if (!pg->text) pg->text = msDup("\n");
+}
+
+static void renderPlainText(BrowserPage *pg, const char *s, size_t n)
+{
+    Render r;
+    size_t i = 0;
+
+    memset(&r, 0, sizeof r);
+    bbInit(&r.out);
+    while (i < n && r.out.n < BROWSER_MAX_TEXT) {
+        size_t j = i;
+        while (j < n && s[j] != '\n') j++;
+        rText(&r, s + i, j - i);
+        rBreak(&r, 1);
+        i = (j < n) ? j + 1 : n;
+    }
+    rFlush(&r);
+    cleanText(&r.out);
+    pg->text = r.out.p;
+    if (!pg->text) pg->text = msDup("\n");
+}
+
+static void htmlTitle(const char *html, size_t len, char *out, size_t osz)
+{
+    const char *start, *gt, *close, *end = html + len;
+    BBuf b;
+
+    if (osz) out[0] = '\0';
+    start = findCI(html, len, "<title");
+    if (!start) return;
+    for (gt = start; gt < end && *gt != '>'; gt++)
+        ;
+    if (gt >= end) return;
+    gt++;
+    close = findCI(gt, (size_t)(end - gt), "</title");
+    if (!close) close = end;
+    bbInit(&b);
+    decodeText(&b, gt, (size_t)(close - gt));
+    if (b.p) {
+        size_t i, o = 0;
+        int space = 0;
+        for (i = 0; i < b.n && o + 1 < osz; i++) {
+            unsigned char c = (unsigned char)b.p[i];
+            if (isspace(c)) { space = 1; continue; }
+            if (space && o > 0 && o + 1 < osz) out[o++] = ' ';
+            space = 0;
+            out[o++] = (char)c;
+        }
+        out[o] = '\0';
+    }
+    bbFree(&b);
+}
+
+static int looksBinary(const char *b, size_t n)
+{
+    size_t lim = n < 4096 ? n : 4096;
+    if (!b) return 0;
+    return memchr(b, '\0', lim) != NULL;
+}
+
+static int looksLikeHtml(const char *type, const char *body, size_t n)
+{
+    if (type && (ciPrefix(type, "text/html") || ciPrefix(type, "application/xhtml"))) return 1;
+    if (type && *type && !ciPrefix(type, "text/plain")) return 0;
+    if (body && n) {
+        size_t lim = n < 2048 ? n : 2048;
+        if (findCI(body, lim, "<html") || findCI(body, lim, "<!doctype")) return 1;
+    }
+    return 0;
+}
+
+/* ---- fetching ---- */
+
+static size_t browserCurlWrite(void *ptr, size_t sz, size_t nm, void *ud)
+{
+    BBuf *b = (BBuf *)ud;
+    size_t n = sz * nm;
+    if (b->n + n > MAX_VIEW_BYTES) return 0;
+    if (bbReserve(b, n) != 0) return 0;
+    memcpy(b->p + b->n, ptr, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+    return n;
+}
+
+static void urlHost(const char *url, char *out, size_t osz)
+{
+    const char *sep = strstr(url, "://");
+    const char *q = sep ? sep + 3 : url;
+    size_t n = strcspn(q, "/?#");
+    if (n >= osz) n = osz ? osz - 1 : 0;
+    if (n) memcpy(out, q, n);
+    if (osz) out[n] = '\0';
+}
+
+static int browserFetch(BrowserPage *pg, const char *url, char *err, size_t errsz)
+{
+    CURL *c;
+    CURLcode ce;
+    BBuf raw;
+    long status = 0;
+    const char *info = NULL;
+    char ctype[64] = "", eff[MS_PATH_MAX] = "";
+    char errbuf[CURL_ERROR_SIZE];
+
+    memset(pg, 0, sizeof *pg);
+    errbuf[0] = '\0';
+    c = curl_easy_init();
+    if (!c) {
+        snprintf(err, errsz, "networking is unavailable");
+        return -1;
+    }
+    bbInit(&raw);
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, BROWSER_UA);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, browserCurlWrite);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &raw);
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+
+    ce = curl_easy_perform(c);
+    if (ce == CURLE_WRITE_ERROR && raw.n >= MAX_VIEW_BYTES) ce = CURLE_OK;
+    if (ce != CURLE_OK) {
+        snprintf(err, errsz, "%s", errbuf[0] ? errbuf : curl_easy_strerror(ce));
+        curl_easy_cleanup(c);
+        bbFree(&raw);
+        return -1;
+    }
+    /* These strings belong to the easy handle, so copy them before cleanup. */
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    if (curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &info) == CURLE_OK && info)
+        safeCopy(ctype, sizeof ctype, info);
+    info = NULL;
+    if (curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &info) == CURLE_OK && info)
+        safeCopy(eff, sizeof eff, info);
+    curl_easy_cleanup(c);
+
+    pg->status = status;
+    safeCopy(pg->type, sizeof pg->type, ctype[0] ? ctype : "text/html");
+    safeCopy(pg->url, sizeof pg->url, eff[0] ? eff : url);
+    urlHost(pg->url, pg->host, sizeof pg->host);
+
+    if (looksBinary(raw.p, raw.n) || ciPrefix(pg->type, "image/") ||
+        ciPrefix(pg->type, "application/octet-stream") ||
+        ciPrefix(pg->type, "application/pdf") || ciPrefix(pg->type, "audio/") ||
+        ciPrefix(pg->type, "video/")) {
+        BBuf b;
+        char sz[32];
+        bbInit(&b);
+        bbChar(&b, '[');
+        bbPuts(&b, pg->type);
+        bbPuts(&b, "]  ");
+        fmtSize(sz, sizeof sz, (long long)raw.n);
+        bbPuts(&b, sz);
+        bbPuts(&b, "\n\nThis is not a text document, so there is nothing to read here.");
+        cleanText(&b);
+        pg->text = b.p;
+        if (!pg->text) pg->text = msDup("\n");
+        safeCopy(pg->title, sizeof pg->title, pg->host);
+    } else if (looksLikeHtml(pg->type, raw.p, raw.n)) {
+        htmlTitle(raw.p ? raw.p : "", raw.n, pg->title, sizeof pg->title);
+        if (!pg->title[0]) safeCopy(pg->title, sizeof pg->title, pg->host);
+        renderHtml(pg, raw.p ? raw.p : "", raw.n);
+    } else {
+        safeCopy(pg->title, sizeof pg->title, pg->host);
+        renderPlainText(pg, raw.p ? raw.p : "", raw.n);
+    }
+    bbFree(&raw);
+    return 0;
+}
+
+/* ---- session navigation ---- */
+
+typedef struct { char **items; int n, cap; } UrlStack;
+
+static void urlPush(UrlStack *s, const char *url)
+{
+    char *copy;
+    if (s->n == s->cap) {
+        int nc = s->cap ? s->cap * 2 : 8;
+        char **ni = (char **)realloc(s->items, (size_t)nc * sizeof *ni);
+        if (!ni) return;
+        s->items = ni;
+        s->cap = nc;
+    }
+    copy = msDup(url);
+    if (!copy) return;
+    s->items[s->n++] = copy;
+}
+
+static int urlPop(UrlStack *s, char *out, size_t osz)
+{
+    if (s->n <= 0) return 0;
+    s->n--;
+    safeCopy(out, osz, s->items[s->n]);
+    free(s->items[s->n]);
+    s->items[s->n] = NULL;
+    return 1;
+}
+
+static void urlClear(UrlStack *s)
+{
+    while (s->n > 0) free(s->items[--s->n]);
+    free(s->items);
+    s->items = NULL;
+    s->cap = 0;
+}
+
+static void browserHistoryAdd(const char *url)
+{
+    FILE *f = fopen(BROWSER_HISTORY, "ab");
+    if (!f) return;
+    fprintf(f, "%s\n", url);
+    fclose(f);
+}
+
+static int browserOpen(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
+                       const char *url, int record)
+{
+    BrowserPage np;
+    char err[200];
+
+    memset(&np, 0, sizeof np);
+    if (browserFetch(&np, url, err, sizeof err) != 0) {
+        safeCopy(browserError, sizeof browserError, err);
+        return 0;
+    }
+    if (record) {
+        if (pg->url[0]) urlPush(back, pg->url);
+        urlClear(fwd);
+        browserHistoryAdd(np.url);
+    }
+    pageFree(pg);
+    *pg = np;
+    return 1;
+}
+
+static int browserBack(BrowserPage *pg, UrlStack *back, UrlStack *fwd)
+{
+    char url[MS_PATH_MAX], err[200];
+    BrowserPage np;
+
+    if (!urlPop(back, url, sizeof url)) {
+        safeCopy(browserError, sizeof browserError, "No earlier page in this session.");
+        return 0;
+    }
+    memset(&np, 0, sizeof np);
+    if (browserFetch(&np, url, err, sizeof err) != 0) {
+        urlPush(back, url);
+        safeCopy(browserError, sizeof browserError, err);
+        return 0;
+    }
+    urlPush(fwd, pg->url);
+    pageFree(pg);
+    *pg = np;
+    return 1;
+}
+
+static int browserForward(BrowserPage *pg, UrlStack *back, UrlStack *fwd)
+{
+    char url[MS_PATH_MAX], err[200];
+    BrowserPage np;
+
+    if (!urlPop(fwd, url, sizeof url)) {
+        safeCopy(browserError, sizeof browserError, "No later page in this session.");
+        return 0;
+    }
+    memset(&np, 0, sizeof np);
+    if (browserFetch(&np, url, err, sizeof err) != 0) {
+        urlPush(fwd, url);
+        safeCopy(browserError, sizeof browserError, err);
+        return 0;
+    }
+    urlPush(back, pg->url);
+    pageFree(pg);
+    *pg = np;
+    return 1;
+}
+
+static int browserReload(BrowserPage *pg)
+{
+    BrowserPage np;
+    char err[200];
+
+    memset(&np, 0, sizeof np);
+    if (browserFetch(&np, pg->url, err, sizeof err) != 0) {
+        safeCopy(browserError, sizeof browserError, err);
+        return 0;
+    }
+    pageFree(pg);
+    *pg = np;
+    return 1;
+}
+
+/* ---- screen drawing ---- */
+
+static void browserSay(Style st, const char *fmt, ...) MS_FMT(2, 3);
+static void browserSay(Style st, const char *fmt, ...)
+{
+    va_list ap;
+    printf("  %s", sty(st));
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("%s\n", sty(ST_RESET));
+}
+
+static int textLineCount(const char *t)
+{
+    int n = 0;
+    if (!t) return 0;
+    while (*t) {
+        if (*t == '\n') n++;
+        t++;
+    }
+    return n;
+}
+
+static const char *textLine(const char *t, int idx)
+{
+    while (idx-- > 0 && t) {
+        const char *nl = strchr(t, '\n');
+        t = nl ? nl + 1 : NULL;
+    }
+    return t;
+}
+
+static void browserDraw(const BrowserPage *pg, int top)
+{
+    char title[120], url[MS_PATH_MAX], type[24];
+    int total = textLineCount(pg->text);
+    int pages = total ? (total + BROWSER_LINES - 1) / BROWSER_LINES : 1;
+    int page = total ? (top / BROWSER_LINES) + 1 : 1;
+    int i;
+
+    truncCols(title, sizeof title, pg->title[0] ? pg->title : "(untitled)", 70);
+    truncCols(url, sizeof url, pg->url, 72);
+    truncCols(type, sizeof type, pg->type, 20);
+
+    printf("\n  %s%s%s\n", sty(ST_BOLD), title, sty(ST_RESET));
+    printf("  %s%s%s\n", sty(ST_DIM), url, sty(ST_RESET));
+    printf("%s", sty(ST_DIM));
+    repeat("-", 62);
+    printf("%s\n", sty(ST_RESET));
+
+    if (total == 0) {
+        printf("  %s(no readable text on this page)%s\n", sty(ST_DIM), sty(ST_RESET));
+    }
+    for (i = 0; i < BROWSER_LINES && top + i < total; i++) {
+        const char *ln = textLine(pg->text, top + i);
+        const char *nl;
+        int len;
+        if (!ln) break;
+        nl = strchr(ln, '\n');
+        len = nl ? (int)(nl - ln) : (int)strlen(ln);
+        printf("  %.*s\n", len, ln);
+    }
+
+    printf("%s", sty(ST_DIM));
+    repeat("-", 40);
+    printf("%s  %sHTTP %ld%s  %s%s%s  %d/%d\n",
+           sty(ST_RESET),
+           pg->status >= 400 ? sty(ST_BAD) : sty(ST_DIM), pg->status, sty(ST_RESET),
+           sty(ST_DIM), type, sty(ST_RESET),
+           page, pages);
+    printf("  %s# link  n/p page  u url  s find  l links  b/f back/fwd  r reload  m marks  h hist  q quit%s\n",
+           sty(ST_DIM), sty(ST_RESET));
+}
+
+static void browserShowLinks(const BrowserPage *pg)
+{
+    int i, cap;
+    appHeader("Page Links");
+    if (pg->linkCount == 0) {
+        printf("\n  This page has no links.\n");
+        return;
+    }
+    cap = pg->linkCount < 100 ? pg->linkCount : 100;
+    printf("\n");
+    for (i = 0; i < cap; i++) {
+        char u[120];
+        truncCols(u, sizeof u, pg->links[i], 96);
+        printf("  %s%3d%s  %s\n", sty(ST_ACCENT), i + 1, sty(ST_RESET), u);
+    }
+    if (pg->linkCount > cap) printf("\n  ... %d more not shown.\n", pg->linkCount - cap);
+}
+
+/* ---- bookmarks and history ---- */
+
+static void freeLines(char **v, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+static void loadLines(const char *path, char ***out, int *count)
+{
+    FILE *f = fopen(path, "rb");
+    char line[MS_PATH_MAX];
+    char **v = NULL;
+    int n = 0, cap = 0;
+
+    *out = NULL;
+    *count = 0;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *t = trim(line);
+        char *d;
+        if (!*t) continue;
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 32;
+            char **nv = (char **)realloc(v, (size_t)nc * sizeof *nv);
+            if (!nv) break;
+            v = nv;
+            cap = nc;
+        }
+        d = msDup(t);
+        if (!d) break;
+        v[n++] = d;
+    }
+    fclose(f);
+    *out = v;
+    *count = n;
+}
+
+static void loadBookmarks(char ***urls, char ***titles, int *count)
+{
+    FILE *f = fopen(BROWSER_BOOKMARKS, "rb");
+    char line[MS_PATH_MAX];
+    char **u = NULL, **t = NULL;
+    int n = 0, cap = 0;
+
+    *urls = NULL;
+    *titles = NULL;
+    *count = 0;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *v = trim(line);
+        char *tab, *url, *title;
+        if (!*v) continue;
+        tab = strchr(v, '\t');
+        if (tab) {
+            *tab = '\0';
+            url = trim(v);
+            title = trim(tab + 1);
+        } else {
+            url = v;
+            title = v;
+        }
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 16;
+            char **nu = (char **)realloc(u, (size_t)nc * sizeof *nu);
+            char **nt;
+            if (!nu) break;
+            u = nu;
+            nt = (char **)realloc(t, (size_t)nc * sizeof *nt);
+            if (!nt) break;
+            t = nt;
+            cap = nc;
+        }
+        u[n] = msDup(url);
+        t[n] = msDup(title);
+        if (!u[n] || !t[n]) break;
+        n++;
+    }
+    fclose(f);
+    *urls = u;
+    *titles = t;
+    *count = n;
+}
+
+static void saveBookmarks(char **urls, char **titles, int n)
+{
+    FILE *f = fopen(BROWSER_BOOKMARKS, "wb");
+    int i;
+    if (!f) return;
+    for (i = 0; i < n; i++)
+        fprintf(f, "%s\t%s\n", urls[i], titles[i] ? titles[i] : "");
+    fclose(f);
+}
+
+static int browserBookmarksMenu(const BrowserPage *pg, char *openUrl, size_t osz)
+{
+    char cmd[MS_PATH_MAX];
+
+    for (;;) {
+        char **urls = NULL, **titles = NULL;
+        int n = 0, i;
+
+        loadBookmarks(&urls, &titles, &n);
+        appHeader("Bookmarks");
+        if (n == 0) printf("\n  No bookmarks yet - open a page and press a here.\n");
+        else {
+            printf("\n");
+            for (i = 0; i < n; i++) {
+                char t[70], u[80];
+                truncCols(t, sizeof t, titles[i][0] ? titles[i] : urls[i], 56);
+                truncCols(u, sizeof u, urls[i], 72);
+                printf("  %s%3d%s  %s\n        %s%s%s\n", sty(ST_ACCENT), i + 1, sty(ST_RESET),
+                       t, sty(ST_DIM), u, sty(ST_RESET));
+            }
+        }
+        {
+            char cur[90];
+            truncCols(cur, sizeof cur, pg->title[0] ? pg->title : pg->url, 60);
+            printf("\n  a add \"%s\"   d <number> remove   number open   q back\n", cur);
+        }
+        if (readLine("  > ", cmd, sizeof cmd) != IN_OK) {
+            freeLines(urls, n);
+            freeLines(titles, n);
+            return 0;
+        }
+        {
+            char *v = trim(cmd);
+            if (!*v || ciEqual(v, "q")) {
+                freeLines(urls, n);
+                freeLines(titles, n);
+                return 0;
+            }
+            if (ciEqual(v, "a")) {
+                FILE *f = fopen(BROWSER_BOOKMARKS, "ab");
+                if (!f) browserSay(ST_BAD, "Cannot write bookmarks: %s", strerror(errno));
+                else {
+                    fprintf(f, "%s\t%s\n", pg->url, pg->title);
+                    fclose(f);
+                    browserSay(ST_GOOD, "Bookmark saved.");
+                }
+            } else if (v[0] == 'd' && (v[1] == '\0' || isspace((unsigned char)v[1]))) {
+                long k = strtol(trim(v + 1), NULL, 10);
+                if (k >= 1 && k <= n) {
+                    free(urls[k - 1]);
+                    free(titles[k - 1]);
+                    memmove(urls + k - 1, urls + k, (size_t)(n - k) * sizeof *urls);
+                    memmove(titles + k - 1, titles + k, (size_t)(n - k) * sizeof *titles);
+                    n--;
+                    saveBookmarks(urls, titles, n);
+                    browserSay(ST_GOOD, "Bookmark removed.");
+                } else {
+                    browserSay(ST_BAD, "There is no bookmark %ld.", k);
+                }
+            } else {
+                char *endp = NULL;
+                long k = strtol(v, &endp, 10);
+                if (endp && *trim(endp)) {
+                    browserSay(ST_BAD, "Enter a bookmark number, a, d <n> or q.");
+                } else if (k >= 1 && k <= n) {
+                    safeCopy(openUrl, osz, urls[k - 1]);
+                    freeLines(urls, n);
+                    freeLines(titles, n);
+                    return 1;
+                } else {
+                    browserSay(ST_BAD, "There is no bookmark %ld.", k);
+                }
+            }
+        }
+        freeLines(urls, n);
+        freeLines(titles, n);
+    }
+}
+
+static int browserHistoryMenu(char *openUrl, size_t osz)
+{
+    char cmd[64];
+
+    for (;;) {
+        char **lines = NULL;
+        int n = 0, i, shown = 0;
+
+        loadLines(BROWSER_HISTORY, &lines, &n);
+        appHeader("History");
+        if (n == 0) printf("\n  No pages visited yet.\n");
+        else {
+            shown = n < 30 ? n : 30;
+            printf("\n");
+            for (i = 0; i < shown; i++) {
+                char u[100];
+                truncCols(u, sizeof u, lines[n - 1 - i], 92);
+                printf("  %s%3d%s  %s\n", sty(ST_ACCENT), i + 1, sty(ST_RESET), u);
+            }
+            if (n > shown) printf("\n  (showing the %d most recent of %d)\n", shown, n);
+        }
+        if (n < shown) shown = n;
+        printf("\n  number open   c clear history   q back\n");
+        if (readLine("  > ", cmd, sizeof cmd) != IN_OK) {
+            freeLines(lines, n);
+            return 0;
+        }
+        {
+            char *v = trim(cmd);
+            if (!*v || ciEqual(v, "q")) {
+                freeLines(lines, n);
+                return 0;
+            }
+            if (ciEqual(v, "c")) {
+                if (confirm("Clear the whole browsing history?")) {
+                    remove(BROWSER_HISTORY);
+                    browserSay(ST_GOOD, "History cleared.");
+                }
+            } else {
+                char *endp = NULL;
+                long k = strtol(v, &endp, 10);
+                if (endp && *trim(endp)) {
+                    browserSay(ST_BAD, "Enter a history number, c or q.");
+                } else if (k >= 1 && k <= shown) {
+                    safeCopy(openUrl, osz, lines[n - (int)k]);
+                    freeLines(lines, n);
+                    return 1;
+                } else {
+                    browserSay(ST_BAD, "There is no history entry %ld.", k);
+                }
+            }
+        }
+        freeLines(lines, n);
+    }
+}
+
+/* ---- the application ---- */
+
+#endif /* HAVE_CURL */
+
 static void browserApp(void)
 {
 #ifdef HAVE_CURL
-    char url[MS_PATH_MAX],b[256]; CURL *c; struct CurlBuffer out={0}; long code=0; char title[160]="(untitled)";
-    for(;;){appHeader("MetaDOS Browser");printf("\n  Enter a URL, search terms, or q to return.\n");if(readLine("  Address: ",url,sizeof url)!=IN_OK||ciEqual(trim(url),"q")){free(out.p);return;}if(!strstr(url,"://")){char q[MS_PATH_MAX];snprintf(q,sizeof q,"https://www.google.com/search?q=%s",trim(url));safeCopy(url,sizeof url,q);}c=curl_easy_init();if(!c){setNotice(ST_BAD,"Browser networking is unavailable.");return;}curl_easy_setopt(c,CURLOPT_URL,trim(url));curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);curl_easy_setopt(c,CURLOPT_MAXREDIRS,5L);curl_easy_setopt(c,CURLOPT_USERAGENT,"MetaDOS-Browser/1.0");curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,browserWrite);curl_easy_setopt(c,CURLOPT_WRITEDATA,&out);curl_easy_setopt(c,CURLOPT_TIMEOUT,20L);{ CURLcode ce = curl_easy_perform(c); if(ce!=CURLE_OK){printf("\n  Connection error: %s\n",curl_easy_strerror(ce));curl_easy_cleanup(c);free(out.p);out.p=NULL;out.n=out.cap=0;appBackPrompt();continue;} } curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);curl_easy_cleanup(c);printf("\n  URL: %s\n  HTTP status: %ld\n\n",url,code);browserText(out.p?out.p:"");{FILE*f=fopen("browser_history.txt","ab");if(f){fprintf(f,"%s\n",url);fclose(f);}}printf("\n  b Bookmark   q Back   r Reload URL\n");if(readLine("  > ",b,sizeof b)!=IN_OK||ciEqual(trim(b),"q")){free(out.p);return;}if(b[0]=='b'){FILE*f=fopen("browser_bookmarks.txt","ab");if(f){fprintf(f,"%s\n",url);fclose(f);setNotice(ST_GOOD,"Bookmark saved.");}}free(out.p);out.p=NULL;out.n=out.cap=0;}
+    BrowserPage page;
+    UrlStack back, fwd;
+    char line[MS_PATH_MAX], target[MS_PATH_MAX], argbuf[MS_PATH_MAX];
+    int havePage = 0, top = 0;
+
+    memset(&page, 0, sizeof page);
+    memset(&back, 0, sizeof back);
+    memset(&fwd, 0, sizeof fwd);
+
+    for (;;) {
+        InStatus st;
+        char *cmd;
+
+        if (!havePage) {
+            appHeader("MetaDOS Browser");
+            printf("\n  Type an address or search terms, then press ENTER.\n");
+            printf("  Links are numbered: type a number to follow one.  q returns.\n");
+            st = readLine("\n  Address > ", line, sizeof line);
+            if (st == IN_EOF) break;
+            if (st != IN_OK) {
+                browserSay(ST_BAD, "Input rejected: unsupported characters or too long.");
+                appBackPrompt();
+                continue;
+            }
+            cmd = trim(line);
+            if (!*cmd || ciEqual(cmd, "q")) break;
+            browserNormalizeInput(cmd, target, sizeof target);
+            if (!browserOpen(&page, &back, &fwd, target, 1)) {
+                printf("\n  %sCannot load: %s%s\n", sty(ST_BAD), browserError, sty(ST_RESET));
+                appBackPrompt();
+                continue;
+            }
+            havePage = 1;
+            top = 0;
+            continue;
+        }
+
+        appHeader("MetaDOS Browser");
+        browserDraw(&page, top);
+        st = readLine("  > ", line, sizeof line);
+        if (st == IN_EOF) break;
+        if (st != IN_OK) {
+            browserSay(ST_BAD, "Input rejected: unsupported characters or too long.");
+            appBackPrompt();
+            continue;
+        }
+        cmd = trim(line);
+
+        if (!*cmd || ciEqual(cmd, "n") || ciEqual(cmd, "next")) {
+            int total = textLineCount(page.text);
+            if (top + BROWSER_LINES < total) top += BROWSER_LINES;
+            else browserSay(ST_WARN, "This is the end of the page.");
+            continue;
+        }
+        if (ciEqual(cmd, "p") || ciEqual(cmd, "prev")) {
+            top -= BROWSER_LINES;
+            if (top < 0) top = 0;
+            continue;
+        }
+        if (ciEqual(cmd, "l") || ciEqual(cmd, "links")) {
+            browserShowLinks(&page);
+            appBackPrompt();
+            continue;
+        }
+        if (ciEqual(cmd, "b") || ciEqual(cmd, "back")) {
+            if (browserBack(&page, &back, &fwd)) top = 0;
+            else {
+                browserSay(ST_WARN, "%s", browserError);
+                appBackPrompt();
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "f") || ciEqual(cmd, "fwd") || ciEqual(cmd, "forward")) {
+            if (browserForward(&page, &back, &fwd)) top = 0;
+            else {
+                browserSay(ST_WARN, "%s", browserError);
+                appBackPrompt();
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "r") || ciEqual(cmd, "reload")) {
+            if (browserReload(&page)) top = 0;
+            else {
+                browserSay(ST_BAD, "Cannot reload: %s", browserError);
+                appBackPrompt();
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "m") || ciEqual(cmd, "marks") || ciEqual(cmd, "bookmarks")) {
+            if (browserBookmarksMenu(&page, target, sizeof target)) {
+                if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+                else {
+                    browserSay(ST_BAD, "Cannot load: %s", browserError);
+                    appBackPrompt();
+                }
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "h") || ciEqual(cmd, "hist") || ciEqual(cmd, "history")) {
+            if (browserHistoryMenu(target, sizeof target)) {
+                if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+                else {
+                    browserSay(ST_BAD, "Cannot load: %s", browserError);
+                    appBackPrompt();
+                }
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "q") || ciEqual(cmd, "quit") || ciEqual(cmd, "exit")) break;
+
+        if (ciEqual(cmd, "u") || ciEqual(cmd, "url") || ciPrefix(cmd, "u ") ||
+            ciPrefix(cmd, "open ")) {
+            char *arg;
+            if (ciEqual(cmd, "u") || ciEqual(cmd, "url")) {
+                st = readLine("  Address > ", argbuf, sizeof argbuf);
+                if (st == IN_EOF) break;
+                if (st != IN_OK) {
+                    browserSay(ST_BAD, "Input rejected: unsupported characters or too long.");
+                    appBackPrompt();
+                    continue;
+                }
+                arg = trim(argbuf);
+            } else {
+                arg = trim(cmd + (cmd[0] == 'u' ? 1 : 4));
+            }
+            if (!*arg) continue;
+            browserNormalizeInput(arg, target, sizeof target);
+            if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+            else {
+                browserSay(ST_BAD, "Cannot load: %s", browserError);
+                appBackPrompt();
+            }
+            continue;
+        }
+        if (ciEqual(cmd, "s") || ciEqual(cmd, "find") || ciEqual(cmd, "search") ||
+            ciPrefix(cmd, "s ") || ciPrefix(cmd, "find ") || ciPrefix(cmd, "search ")) {
+            char *arg = trim(cmd + strcspn(cmd, " \t"));
+            if (!*arg) {
+                st = readLine("  Search > ", argbuf, sizeof argbuf);
+                if (st == IN_EOF) break;
+                if (st != IN_OK) {
+                    browserSay(ST_BAD, "Input rejected: unsupported characters or too long.");
+                    appBackPrompt();
+                    continue;
+                }
+                arg = trim(argbuf);
+            }
+            if (!*arg) continue;
+            browserSearch(arg, target, sizeof target);
+            if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+            else {
+                browserSay(ST_BAD, "Cannot search: %s", browserError);
+                appBackPrompt();
+            }
+            continue;
+        }
+        if (isdigit((unsigned char)cmd[0])) {
+            char *endp = NULL;
+            long n = strtol(cmd, &endp, 10);
+            if (endp && !*trim(endp)) {
+                if (n >= 1 && n <= page.linkCount) {
+                    safeCopy(target, sizeof target, page.links[n - 1]);
+                    if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+                    else {
+                        browserSay(ST_BAD, "Cannot load: %s", browserError);
+                        appBackPrompt();
+                    }
+                } else {
+                    browserSay(ST_BAD, "This page has links 1-%d, not %ld.", page.linkCount, n);
+                    appBackPrompt();
+                }
+                continue;
+            }
+        }
+
+        /* Anything else is an address or a search. */
+        browserNormalizeInput(cmd, target, sizeof target);
+        if (browserOpen(&page, &back, &fwd, target, 1)) top = 0;
+        else {
+            browserSay(ST_BAD, "Cannot load: %s", browserError);
+            appBackPrompt();
+        }
+    }
+
+    pageFree(&page);
+    urlClear(&back);
+    urlClear(&fwd);
 #else
-    appHeader("MetaDOS Browser");printf("\n  Browser networking is not compiled in. Build with libcurl:\n  gcc -std=c11 -DHAVE_CURL -o metashell main_system.c $(pkg-config --cflags --libs libcurl)\n  The browser uses libcurl for HTTP/HTTPS, follows redirects, records history/bookmarks, and renders downloaded HTML as readable text inside MetaDOS.\n");appBackPrompt();
+    appHeader("MetaDOS Browser");
+    printf("\n  Browser networking is not compiled in. Build with libcurl:\n"
+           "  gcc -std=c11 -DHAVE_CURL -o metashell main_system.c $(pkg-config --cflags --libs libcurl)\n\n"
+           "  The browser downloads real HTTP/HTTPS pages, renders them as readable text\n"
+           "  with numbered links, and keeps back/forward, reload, search, bookmarks and history.\n");
+    appBackPrompt();
 #endif
 }
 
@@ -3063,6 +4778,37 @@ static int selfTest(void)
         CHECK(!validLeafName("a/b", why, sizeof why) && !validLeafName("", why, sizeof why) && validLeafName("notes.txt", why, sizeof why), "leaf-name validation");
         CHECK(!validUsernameStrict("ab", why, sizeof why) && validUsernameStrict("princewill", why, sizeof why), "username validation");
     }
+#ifdef HAVE_CURL
+    {
+        BBuf b;
+        char out[256];
+        BrowserPage pg;
+        const char *src = "a &amp; b &#65;&#x42; &nbsp;c";
+        const char *html = "<html><head><title>Hi &amp; bye</title></head><body>"
+                           "<h1>Title</h1><p>Read <a href=\"/x\">this</a>.</p>"
+                           "<ul><li>one</li><li>two</li></ul></body></html>";
+        bbInit(&b);
+        decodeText(&b, src, strlen(src));
+        CHECK(b.p && !strcmp(b.p, "a & b AB  c"), "browser decodes HTML entities");
+        bbFree(&b);
+        browserResolve("https://example.com/a/b.html", "../c.html", out, sizeof out);
+        CHECK(!strcmp(out, "https://example.com/c.html"), "browser resolves ../ links");
+        browserResolve("https://example.com/a/b.html", "/root.html", out, sizeof out);
+        CHECK(!strcmp(out, "https://example.com/root.html"), "browser resolves absolute paths");
+        browserResolve("http://example.com/x", "//cdn.test/y", out, sizeof out);
+        CHECK(!strcmp(out, "http://cdn.test/y"), "browser resolves protocol-relative links");
+        browserNormalizeInput("example.com", out, sizeof out);
+        CHECK(!strcmp(out, "https://example.com"), "browser expands a bare domain");
+        memset(&pg, 0, sizeof pg);
+        safeCopy(pg.url, sizeof pg.url, "https://example.com/");
+        renderHtml(&pg, html, strlen(html));
+        htmlTitle(html, strlen(html), pg.title, sizeof pg.title);
+        CHECK(pg.linkCount == 1 && !strcmp(pg.links[0], "https://example.com/x"), "browser collects link targets");
+        CHECK(pg.text && strstr(pg.text, "this [1]") && strstr(pg.text, "one") && strstr(pg.text, "two"), "browser renders links and lists");
+        CHECK(!strcmp(pg.title, "Hi & bye"), "browser reads the page title");
+        pageFree(&pg);
+    }
+#endif
 #undef CHECK
     printf("%s\n", fails ? "SELF-TEST FAILED" : "All self-tests passed.");
     return fails ? 1 : 0;
