@@ -2884,7 +2884,7 @@ static void systemLogViewerApp(void)
 static void userManagerApp(void)
 {char b[256],why[128];for(;;){UserDb db;appHeader("User Manager");if(dbLoad(&db)>=0){for(size_t i=0;i<db.count;i++)if(db.items[i].kind!=U_INVALID)printf("  %-24s %s\n",db.items[i].name,ciEqual(db.items[i].name,os.user)?"(active)":"");dbFree(&db);}printf("\n  a Add account   r Rename active account   d Delete account   q Back\n");if(readLine("  > ",b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(b[0]=='a'){createAccount();}else if(b[0]=='r'){printf("  Use Settings to rename the active account.\n");}else if(b[0]=='d'){char u[64];if(readLine("  Username to delete: ",u,sizeof u)!=IN_OK||ciEqual(trim(u),os.user))continue;if(confirm("Delete this account?")){UserDb x;if(dbLoad(&x)==0){UserRec*r=dbFind(&x,trim(u));if(r){memmove(r,r+1,(x.count-(size_t)(r-x.items)-1)*sizeof *r);x.count--;dbSave(&x);appLog("USERS","deleted account %s",u);}dbFree(&x);}}} (void)why;}}
 static void helpCentreApp(void)
-{char b[160];for(;;){appHeader("Help Centre");printf("\n  MetaDOS keeps user data in the working directory.\n  File Manager manages files without launching host programs.\n  Terminal runs built-in commands only.\n  Text Editor uses :w to save and :q to leave.\n  Browser opens real HTTP/HTTPS pages: numbered links, back/forward, reload,\n  search, bookmarks and history, rendered as readable text.\n  Backup Manager copies notes, tasks, events, logs and notifications.\n\n  Search help (optional) or q to return: ");if(readLine(NULL,b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(*trim(b))printf("\n  Search results for '%s': see the matching application help above.\n",trim(b));appBackPrompt();}}
+{char b[160];for(;;){appHeader("Help Centre");printf("\n  MetaDOS keeps user data in the working directory.\n  File Manager manages files without launching host programs.\n  Terminal runs built-in commands only.\n  Text Editor uses :w to save and :q to leave.\n  Browser opens real HTTP/HTTPS pages: numbered links, back/forward, reload,\n  search, bookmarks, history and web forms (e fills, t toggles, x presses),\n  rendered as readable text with cookies kept between pages.\n  Backup Manager copies notes, tasks, events, logs and notifications.\n\n  Search help (optional) or q to return: ");if(readLine(NULL,b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(*trim(b))printf("\n  Search results for '%s': see the matching application help above.\n",trim(b));appBackPrompt();}}
 static void notificationCentreApp(void)
 {char b[32];for(;;){appHeader("Notification Centre");if(viewTextFile("notifications.log",0)!=0)printf("\n  No notifications.\n");printf("\n  d dismiss all   q back\n");if(readLine("  > ",b,sizeof b)!=IN_OK||ciEqual(trim(b),"q"))return;if(b[0]=='d'&&confirm("Dismiss all notifications?")){remove("notifications.log");setNotice(ST_GOOD,"Notifications dismissed.");}}}
 
@@ -3136,10 +3136,41 @@ static void decodeInto(char *dst, size_t dsz, const char *s, size_t n)
 
 /* ---- page model ---- */
 
+#define BROWSER_MAX_FIELDS 64
+#define BROWSER_MAX_FORMS  24
+#define BROWSER_OPTIONS    8
+#define BROWSER_OPT_LEN    44
+
+/* One form control: a text box, checkbox, radio button, menu, textarea or
+ * button. Controls are numbered from 1 in reading order so they can be used
+ * from the keyboard. */
+typedef struct {
+    int form;                                     /* owning form, -1 = none */
+    char type[12];                                /* text, checkbox, select */
+    char name[72];                                /* submitted field name   */
+    char label[132];                              /* shown to the user      */
+    char value[400];
+    int checked;                                  /* checkbox / radio state */
+    int optionCount, optionIndex;
+    char optionValue[BROWSER_OPTIONS][BROWSER_OPT_LEN];
+    char optionLabel[BROWSER_OPTIONS][BROWSER_OPT_LEN];
+} BrowserField;
+
+typedef struct {
+    char action[MS_PATH_MAX];
+    char method[8];
+} BrowserForm;
+
 typedef struct {
     char *text;                 /* rendered, wrapped page text              */
     char **links;               /* unique link targets, numbered from 1     */
     int linkCount, linkCap;
+    BrowserField fields[BROWSER_MAX_FIELDS];
+    int fieldCount;
+    BrowserForm forms[BROWSER_MAX_FORMS];
+    int formCount;
+    char *html;                 /* markup kept while the page has forms    */
+    size_t htmlLen;
     char url[MS_PATH_MAX];      /* effective URL after redirects            */
     char title[160];
     char host[128];
@@ -3151,6 +3182,7 @@ static void pageFree(BrowserPage *pg)
 {
     int i;
     free(pg->text);
+    free(pg->html);
     for (i = 0; i < pg->linkCount; i++) free(pg->links[i]);
     free(pg->links);
     memset(pg, 0, sizeof *pg);
@@ -3174,6 +3206,43 @@ static int pageAddLink(BrowserPage *pg, const char *url)
     if (!copy) return 0;
     pg->links[pg->linkCount++] = copy;
     return pg->linkCount;
+}
+
+/* ---- form controls ---- */
+
+static int pageAddField(BrowserPage *pg, int form)
+{
+    BrowserField *f;
+    if (pg->fieldCount >= BROWSER_MAX_FIELDS) return 0;
+    f = &pg->fields[pg->fieldCount];
+    memset(f, 0, sizeof *f);
+    f->form = form;
+    pg->fieldCount++;
+    return pg->fieldCount;
+}
+
+static BrowserField *pageField(BrowserPage *pg, int no)
+{
+    if (no < 1 || no > pg->fieldCount) return NULL;
+    return &pg->fields[no - 1];
+}
+
+static int fieldIsText(const BrowserField *f)
+{
+    return strcmp(f->type, "checkbox") && strcmp(f->type, "radio") &&
+           strcmp(f->type, "select") && strcmp(f->type, "submit") &&
+           strcmp(f->type, "reset") && strcmp(f->type, "button") &&
+           strcmp(f->type, "image") && strcmp(f->type, "hidden");
+}
+
+/* Uncheck every other radio button in the same group. */
+static void pageRadioClear(BrowserPage *pg, int form, const char *name)
+{
+    int i;
+    for (i = 0; i < pg->fieldCount; i++)
+        if (pg->fields[i].form == form && !strcmp(pg->fields[i].type, "radio") &&
+            !strcmp(pg->fields[i].name, name))
+            pg->fields[i].checked = 0;
 }
 
 /* ---- URL handling ---- */
@@ -3347,6 +3416,14 @@ typedef struct {
     int olDepth;
     int olNext[4];
     int truncated;
+    int form;           /* current <form> index, -1 when outside a form     */
+    int capture;        /* 0 none, 1 textarea, 2 option, 3 button           */
+    int capField;       /* field number being captured                      */
+    BBuf cap;           /* text collected for that element                  */
+    char optValue[64];  /* <option> value, kept until its closing tag       */
+    int optSelected;
+    const BrowserField *restore;  /* values carried over a redraw            */
+    int restoreCount;
 } Render;
 
 static void rIndent(Render *r)
@@ -3478,6 +3555,45 @@ static void rMarker(Render *r, int no)
     rWord(r, m, strlen(m));
 }
 
+/* Put the value a control had before a redraw back into it. */
+static void fieldRestore(Render *r, BrowserPage *pg, int no)
+{
+    BrowserField *f;
+    if (!r->restore || no < 1 || no > r->restoreCount) return;
+    f = &pg->fields[no - 1];
+    safeCopy(f->value, sizeof f->value, r->restore[no - 1].value);
+    f->checked = r->restore[no - 1].checked;
+    f->optionIndex = r->restore[no - 1].optionIndex;
+}
+
+/* Draw one form control inline, e.g. "{2} Search: ______" or "{3} [x] News". */
+static void rField(Render *r, const BrowserPage *pg, int no)
+{
+    const BrowserField *f = &pg->fields[no - 1];
+    char line[800];
+    const char *shown;
+
+    if (!strcmp(f->type, "hidden")) return;
+    if (!strcmp(f->type, "checkbox"))
+        snprintf(line, sizeof line, "{%d} %s %s", no, f->checked ? "[x]" : "[ ]", f->label);
+    else if (!strcmp(f->type, "radio"))
+        snprintf(line, sizeof line, "{%d} %s %s", no, f->checked ? "(x)" : "( )", f->label);
+    else if (!strcmp(f->type, "submit") || !strcmp(f->type, "button") ||
+             !strcmp(f->type, "reset") || !strcmp(f->type, "image"))
+        snprintf(line, sizeof line, "{%d} [%s]", no, f->label[0] ? f->label : "Submit");
+    else if (!strcmp(f->type, "select")) {
+        shown = f->optionIndex < f->optionCount ? f->optionLabel[f->optionIndex] : f->value;
+        snprintf(line, sizeof line, "{%d} %s: [%s]", no, f->label, shown && shown[0] ? shown : "-");
+    } else if (!strcmp(f->type, "password"))
+        snprintf(line, sizeof line, "{%d} %s: %s", no, f->label, f->value[0] ? "********" : "________");
+    else if (fieldIsText(f))
+        snprintf(line, sizeof line, "{%d} %s: %s", no, f->label, f->value[0] ? f->value : "________");
+    else
+        return;
+    rBreak(r, 1);
+    rText(r, line, strlen(line));
+}
+
 static void emitHtmlText(Render *r, const char *s, size_t n)
 {
     BBuf b;
@@ -3486,6 +3602,17 @@ static void emitHtmlText(Render *r, const char *s, size_t n)
     bbInit(&b);
     decodeText(&b, s, n);
     if (!b.p) { bbFree(&b); return; }
+    if (r->capture) {
+        /* Inside <textarea>, <option> or <button>: collect the text instead
+         * of rendering it. */
+        for (i = 0; i < b.n; i++) {
+            char c = b.p[i];
+            if (c == '\n' || c == '\t' || c == '\r') c = ' ';
+            bbChar(&r->cap, c);
+        }
+        bbFree(&b);
+        return;
+    }
     if (r->pre) rPreText(r, b.p, b.n);
     else rText(r, b.p, b.n);
     if (r->linkOpen && !r->anchorText) {
@@ -3497,7 +3624,7 @@ static void emitHtmlText(Render *r, const char *s, size_t n)
 
 static const char *const SKIP_TAGS[] = {
     "script", "style", "head", "noscript", "svg", "template", "iframe",
-    "object", "canvas", "select", NULL
+    "object", "canvas", NULL
 };
 static const char *const BLOCK2_TAGS[] = {
     "p", "pre", "blockquote", "ul", "ol", "table", "hr", "section", "article",
@@ -3534,52 +3661,300 @@ static const char *skipElement(const char *p, const char *end, const char *name)
     return end;
 }
 
-static void parseTagAttrs(const char **qp, const char *end, char *href, size_t hsz,
-                          char *alt, size_t asz)
+/* Find the '>' that closes a tag, ignoring ones inside quoted values. */
+static const char *tagEnd(const char *q, const char *end)
 {
-    const char *q = *qp;
     while (q < end && *q != '>') {
-        char an[24];
-        size_t anl = 0;
-        char *dst = NULL;
-        size_t dsz = 0;
+        if (*q == '"' || *q == '\'') {
+            char quote = *q++;
+            while (q < end && *q != quote) q++;
+            if (q < end) q++;
+            continue;
+        }
+        q++;
+    }
+    return q;
+}
 
-        while (q < end && isspace((unsigned char)*q)) q++;
-        if (q >= end || *q == '>') break;
-        if (*q == '/') { q++; continue; }
-        while (q < end && !isspace((unsigned char)*q) && *q != '=' && *q != '>' &&
-               anl + 1 < sizeof an)
-            an[anl++] = (char)tolower((unsigned char)*q++);
-        an[anl] = '\0';
-        while (q < end && isspace((unsigned char)*q)) q++;
-        if (q < end && *q == '=') {
-            const char *v;
-            size_t vn;
-            q++;
-            while (q < end && isspace((unsigned char)*q)) q++;
-            if (q < end && (*q == '"' || *q == '\'')) {
-                char quote = *q++;
-                v = q;
-                while (q < end && *q != quote) q++;
-                vn = (size_t)(q - v);
-                if (q < end) q++;
+/* Read attributes from the text of one tag. Returns 1 when `want` is present;
+ * its value, when it has one, is decoded into `out`. */
+static int attrScan(const char *attrs, size_t n, const char *want, char *out, size_t osz)
+{
+    size_t i = 0;
+    if (out && osz) out[0] = '\0';
+    while (i < n) {
+        char name[24];
+        size_t nl = 0, vs = 0, vn = 0;
+        unsigned char c;
+
+        while (i < n && isspace((unsigned char)attrs[i])) i++;
+        if (i < n && attrs[i] == '/') { i++; continue; }
+        if (i >= n) break;
+        c = (unsigned char)attrs[i];
+        if (!isalnum(c) && c != '_' && c != '-' && c != ':') { i++; continue; }
+        while (i < n && !isspace((unsigned char)attrs[i]) && attrs[i] != '=' &&
+               attrs[i] != '>') {
+            if (nl + 1 < sizeof name) name[nl++] = (char)tolower((unsigned char)attrs[i]);
+            i++;
+        }
+        name[nl] = '\0';
+        while (i < n && isspace((unsigned char)attrs[i])) i++;
+        if (i < n && attrs[i] == '=') {
+            i++;
+            while (i < n && isspace((unsigned char)attrs[i])) i++;
+            if (i < n && (attrs[i] == '"' || attrs[i] == '\'')) {
+                char quote = attrs[i++];
+                vs = i;
+                while (i < n && attrs[i] != quote) i++;
+                vn = i - vs;
+                if (i < n) i++;
             } else {
-                v = q;
-                while (q < end && !isspace((unsigned char)*q) && *q != '>') q++;
-                vn = (size_t)(q - v);
+                vs = i;
+                while (i < n && !isspace((unsigned char)attrs[i])) i++;
+                vn = i - vs;
             }
-            if (!strcmp(an, "href")) { dst = href; dsz = hsz; }
-            else if (!strcmp(an, "alt")) { dst = alt; dsz = asz; }
-            if (dst) decodeInto(dst, dsz, v, vn);
+        }
+        if (nl && !strcmp(name, want)) {
+            if (vn && out) decodeInto(out, osz, attrs + vs, vn);
+            return 1;
         }
     }
-    *qp = q;
+    return 0;
+}
+
+static void attrValue(const char *attrs, size_t n, const char *want, char *out, size_t osz)
+{
+    attrScan(attrs, n, want, out, osz);
+}
+
+static int attrHas(const char *attrs, size_t n, const char *want)
+{
+    return attrScan(attrs, n, want, NULL, 0);
+}
+
+static void capReset(Render *r)
+{
+    if (r->cap.p) { r->cap.n = 0; r->cap.p[0] = '\0'; }
+}
+
+static void capText(const Render *r, char *out, size_t osz)
+{
+    if (osz) safeCopy(out, osz, r->cap.p ? trim(r->cap.p) : "");
 }
 
 static void applyTag(Render *r, BrowserPage *pg, const char *name, int closing,
-                     const char *href, const char *alt)
+                     const char *attrs, size_t alen)
 {
+    char href[MS_PATH_MAX], alt[200];
+
+    href[0] = '\0';
+    alt[0] = '\0';
+
+    /* Inside a control we only care about the tag that ends it. */
+    if (r->capture &&
+        !((r->capture == 1 && !strcmp(name, "textarea")) ||
+          (r->capture == 2 && (!strcmp(name, "option") || !strcmp(name, "select") ||
+                               !strcmp(name, "optgroup"))) ||
+          (r->capture == 3 && !strcmp(name, "button"))))
+        return;
+
+    if (!strcmp(name, "form")) {
+        if (closing) {
+            r->form = -1;
+            rBreak(r, 2);
+        } else {
+            char action[MS_PATH_MAX], method[16];
+            int idx;
+            attrValue(attrs, alen, "action", action, sizeof action);
+            attrValue(attrs, alen, "method", method, sizeof method);
+            rBreak(r, 2);
+            if (pg->formCount >= BROWSER_MAX_FORMS) { r->form = -1; return; }
+            idx = pg->formCount++;
+            memset(&pg->forms[idx], 0, sizeof pg->forms[0]);
+            if (!action[0])
+                safeCopy(pg->forms[idx].action, sizeof pg->forms[idx].action, pg->url);
+            else
+                browserResolve(pg->url, action, pg->forms[idx].action,
+                               sizeof pg->forms[idx].action);
+            safeCopy(pg->forms[idx].method, sizeof pg->forms[idx].method,
+                     ciPrefix(method, "post") ? "POST" : "GET");
+            r->form = idx;
+        }
+        return;
+    }
+
+    if (!strcmp(name, "input") && !closing) {
+        char type[16], fname[80], value[400], ph[160];
+        BrowserField *f;
+        int no;
+
+        attrValue(attrs, alen, "type", type, sizeof type);
+        attrValue(attrs, alen, "name", fname, sizeof fname);
+        attrValue(attrs, alen, "value", value, sizeof value);
+        attrValue(attrs, alen, "placeholder", ph, sizeof ph);
+        if (!type[0]) safeCopy(type, sizeof type, "text");
+        no = pageAddField(pg, r->form);
+        if (!no) return;
+        f = pageField(pg, no);
+        safeCopy(f->type, sizeof f->type,
+                 ciEqual(type, "submit") ? "submit" : (ciEqual(type, "reset") ? "reset" : type));
+        safeCopy(f->name, sizeof f->name, fname);
+        safeCopy(f->value, sizeof f->value, value);
+        if (!strcmp(f->type, "submit") || !strcmp(f->type, "image") ||
+            !strcmp(f->type, "button") || !strcmp(f->type, "reset"))
+            safeCopy(f->label, sizeof f->label,
+                     value[0] ? value : (!strcmp(f->type, "reset") ? "Reset" : "Submit"));
+        else
+            safeCopy(f->label, sizeof f->label,
+                     ph[0] ? ph
+                           : (fname[0] ? fname
+                                       : (ciEqual(type, "password") ? "Password" : "Text")));
+        if (ciEqual(type, "radio") && attrHas(attrs, alen, "checked"))
+            pageRadioClear(pg, r->form, f->name);
+        if (ciEqual(type, "checkbox") || ciEqual(type, "radio")) {
+            f->checked = attrHas(attrs, alen, "checked");
+            if (!f->value[0]) safeCopy(f->value, sizeof f->value, "on");
+        }
+        fieldRestore(r, pg, no);
+        rField(r, pg, no);
+        return;
+    }
+
+    if (!strcmp(name, "textarea")) {
+        if (closing) {
+            if (r->capture == 1) {
+                BrowserField *f = pageField(pg, r->capField);
+                char text[400];
+                capText(r, text, sizeof text);
+                if (f) safeCopy(f->value, sizeof f->value, text);
+                r->capture = 0;
+                fieldRestore(r, pg, r->capField);
+                rField(r, pg, r->capField);
+            }
+            return;
+        }
+        {
+            char fname[80], ph[160];
+            BrowserField *f;
+            int no;
+            attrValue(attrs, alen, "name", fname, sizeof fname);
+            attrValue(attrs, alen, "placeholder", ph, sizeof ph);
+            no = pageAddField(pg, r->form);
+            if (!no) return;
+            f = pageField(pg, no);
+            safeCopy(f->type, sizeof f->type, "textarea");
+            safeCopy(f->name, sizeof f->name, fname);
+            safeCopy(f->label, sizeof f->label,
+                     ph[0] ? ph : (fname[0] ? fname : "Text"));
+            r->capture = 1;
+            r->capField = no;
+            capReset(r);
+        }
+        return;
+    }
+
+    if (!strcmp(name, "select")) {
+        if (closing) {
+            if (r->capture == 2) {
+                BrowserField *f = pageField(pg, r->capField);
+                if (f) {
+                    if (f->optionCount == 0) {
+                        safeCopy(f->optionValue[0], BROWSER_OPT_LEN, "");
+                        safeCopy(f->optionLabel[0], BROWSER_OPT_LEN, "-");
+                        f->optionCount = 1;
+                    }
+                    if (f->optionIndex < 0 || f->optionIndex >= f->optionCount)
+                        f->optionIndex = 0;
+                    safeCopy(f->value, sizeof f->value, f->optionValue[f->optionIndex]);
+                }
+                r->capture = 0;
+                rField(r, pg, r->capField);
+            }
+            return;
+        }
+        {
+            char fname[80];
+            BrowserField *f;
+            int no;
+            attrValue(attrs, alen, "name", fname, sizeof fname);
+            no = pageAddField(pg, r->form);
+            if (!no) return;
+            f = pageField(pg, no);
+            safeCopy(f->type, sizeof f->type, "select");
+            safeCopy(f->name, sizeof f->name, fname);
+            safeCopy(f->label, sizeof f->label, fname[0] ? fname : "Choice");
+            f->optionIndex = 0;
+            fieldRestore(r, pg, no);
+            r->capture = 2;
+            r->capField = no;
+            capReset(r);
+        }
+        return;
+    }
+
+    if (!strcmp(name, "option")) {
+        BrowserField *f;
+        if (r->capture != 2) return;
+        if (!closing) {
+            attrValue(attrs, alen, "value", r->optValue, sizeof r->optValue);
+            r->optSelected = attrHas(attrs, alen, "selected");
+            capReset(r);
+            return;
+        }
+        f = pageField(pg, r->capField);
+        if (f && f->optionCount < BROWSER_OPTIONS) {
+            char option[BROWSER_OPT_LEN];
+            int idx;
+            capText(r, option, sizeof option);
+            idx = f->optionCount++;
+            if (!r->optValue[0]) safeCopy(r->optValue, sizeof r->optValue, option);
+            safeCopy(f->optionValue[idx], BROWSER_OPT_LEN, r->optValue);
+            safeCopy(f->optionLabel[idx], BROWSER_OPT_LEN, option[0] ? option : r->optValue);
+            if (r->optSelected) f->optionIndex = idx;
+        }
+        capReset(r);
+        return;
+    }
+
+    if (!strcmp(name, "optgroup")) return;
+
+    if (!strcmp(name, "button")) {
+        if (closing) {
+            if (r->capture == 3) {
+                BrowserField *f = pageField(pg, r->capField);
+                char text[132];
+                capText(r, text, sizeof text);
+                if (f && text[0]) safeCopy(f->label, sizeof f->label, text);
+                r->capture = 0;
+                rField(r, pg, r->capField);
+            }
+            return;
+        }
+        {
+            char type[16], fname[80], value[400];
+            BrowserField *f;
+            int no;
+            attrValue(attrs, alen, "type", type, sizeof type);
+            attrValue(attrs, alen, "name", fname, sizeof fname);
+            attrValue(attrs, alen, "value", value, sizeof value);
+            no = pageAddField(pg, r->form);
+            if (!no) return;
+            f = pageField(pg, no);
+            safeCopy(f->type, sizeof f->type,
+                     ciPrefix(type, "reset") ? "reset" : "submit");
+            safeCopy(f->name, sizeof f->name, fname);
+            safeCopy(f->value, sizeof f->value, value);
+            safeCopy(f->label, sizeof f->label, "Submit");
+            fieldRestore(r, pg, no);
+            r->capture = 3;
+            r->capField = no;
+            capReset(r);
+        }
+        return;
+    }
+
     if (!strcmp(name, "a")) {
+        attrValue(attrs, alen, "href", href, sizeof href);
         if (closing) {
             if (r->linkOpen) {
                 if (r->anchorText && r->linkNo > 0) {
@@ -3692,6 +4067,7 @@ static void applyTag(Render *r, BrowserPage *pg, const char *name, int closing,
         return;
     }
     if (!strcmp(name, "img")) {
+        attrValue(attrs, alen, "alt", alt, sizeof alt);
         if (!closing && alt[0]) {
             char buf[240];
             snprintf(buf, sizeof buf, "[image: %s]", alt);
@@ -3731,13 +4107,18 @@ static void cleanText(BBuf *b)
     b->n = o;
 }
 
-static void renderHtml(BrowserPage *pg, const char *html, size_t len)
+static void renderHtmlRestore(BrowserPage *pg, const char *html, size_t len,
+                              const BrowserField *restore, int restoreCount)
 {
     Render r;
     const char *p = html, *end = html + len;
 
     memset(&r, 0, sizeof r);
     bbInit(&r.out);
+    bbInit(&r.cap);
+    r.form = -1;
+    r.restore = restore;
+    r.restoreCount = restoreCount;
 
     while (p < end && r.out.n < BROWSER_MAX_TEXT) {
         if (*p != '<') {
@@ -3761,26 +4142,27 @@ static void renderHtml(BrowserPage *pg, const char *html, size_t len)
         }
         {
             const char *q = p + 1;
-            char name[16], href[MS_PATH_MAX], alt[200];
-            size_t nl = 0;
+            const char *attrs, *gt;
+            char name[16];
+            size_t nl = 0, alen;
             int closing = 0;
 
-            href[0] = '\0';
-            alt[0] = '\0';
             if (q < end && *q == '/') { closing = 1; q++; }
             while (q < end && isspace((unsigned char)*q)) q++;
             while (q < end && nl + 1 < sizeof name &&
                    (isalnum((unsigned char)*q) || *q == ':' || *q == '-'))
                 name[nl++] = (char)tolower((unsigned char)*q++);
             name[nl] = '\0';
-            parseTagAttrs(&q, end, href, sizeof href, alt, sizeof alt);
-            p = (q < end) ? q + 1 : end;
+            attrs = q;
+            gt = tagEnd(q, end);
+            alen = (size_t)(gt - attrs);
+            p = (gt < end) ? gt + 1 : end;
 
             if (!closing && tagIn(name, SKIP_TAGS)) {
                 p = skipElement(p, end, name);
                 continue;
             }
-            applyTag(&r, pg, name, closing, href, alt);
+            applyTag(&r, pg, name, closing, attrs, alen);
         }
     }
 
@@ -3788,8 +4170,14 @@ static void renderHtml(BrowserPage *pg, const char *html, size_t len)
     if (r.truncated || r.out.n >= BROWSER_MAX_TEXT)
         bbPuts(&r.out, "\n[Page truncated: too large to display]\n");
     cleanText(&r.out);
+    bbFree(&r.cap);
     pg->text = r.out.p;
     if (!pg->text) pg->text = msDup("\n");
+}
+
+static void renderHtml(BrowserPage *pg, const char *html, size_t len)
+{
+    renderHtmlRestore(pg, html, len, NULL, 0);
 }
 
 static void renderPlainText(BrowserPage *pg, const char *s, size_t n)
@@ -3885,7 +4273,13 @@ static void urlHost(const char *url, char *out, size_t osz)
     if (osz) out[n] = '\0';
 }
 
-static int browserFetch(BrowserPage *pg, const char *url, char *err, size_t errsz)
+#define BROWSER_COOKIES "browser_cookies.txt"
+
+/* Fetch a URL, optionally posting a form body. `referer` (may be NULL) is the
+ * page the request came from. Cookies live in a file so logins and sessions
+ * survive between page loads. */
+static int browserFetchEx(BrowserPage *pg, const char *url, const char *post,
+                          const char *referer, char *err, size_t errsz)
 {
     CURL *c;
     CURLcode ce;
@@ -3909,7 +4303,14 @@ static int browserFetch(BrowserPage *pg, const char *url, char *err, size_t errs
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, BROWSER_UA);
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");
+    curl_easy_setopt(c, CURLOPT_COOKIEFILE, BROWSER_COOKIES);
+    curl_easy_setopt(c, CURLOPT_COOKIEJAR, BROWSER_COOKIES);
+    if (referer && referer[0]) curl_easy_setopt(c, CURLOPT_REFERER, referer);
+    if (post) {
+        curl_easy_setopt(c, CURLOPT_POST, 1L);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, post);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(post));
+    }
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, browserCurlWrite);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &raw);
     curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
@@ -3960,12 +4361,25 @@ static int browserFetch(BrowserPage *pg, const char *url, char *err, size_t errs
         htmlTitle(raw.p ? raw.p : "", raw.n, pg->title, sizeof pg->title);
         if (!pg->title[0]) safeCopy(pg->title, sizeof pg->title, pg->host);
         renderHtml(pg, raw.p ? raw.p : "", raw.n);
+        if (pg->fieldCount > 0) {
+            pg->html = (char *)malloc(raw.n + 1);
+            if (pg->html) {
+                memcpy(pg->html, raw.p ? raw.p : "", raw.n);
+                pg->html[raw.n] = '\0';
+                pg->htmlLen = raw.n;
+            }
+        }
     } else {
         safeCopy(pg->title, sizeof pg->title, pg->host);
         renderPlainText(pg, raw.p ? raw.p : "", raw.n);
     }
     bbFree(&raw);
     return 0;
+}
+
+static int browserFetch(BrowserPage *pg, const char *url, char *err, size_t errsz)
+{
+    return browserFetchEx(pg, url, NULL, NULL, err, errsz);
 }
 
 /* ---- session navigation ---- */
@@ -4013,14 +4427,49 @@ static void browserHistoryAdd(const char *url)
     fclose(f);
 }
 
-static int browserOpen(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
-                       const char *url, int record)
+/* Redraw the page after a control changed so the new value is on screen. The
+ * markup is parsed again and the control states are carried over. */
+static void pageRefreshFields(BrowserPage *pg)
+{
+    BrowserField *save;
+    int i, fc = pg->fieldCount;
+
+    if (!pg->html) return;
+    save = (BrowserField *)malloc(sizeof(BrowserField) * (size_t)(fc ? fc : 1));
+    if (!save) return;
+    if (fc) memcpy(save, pg->fields, sizeof(BrowserField) * (size_t)fc);
+
+    free(pg->text);
+    pg->text = NULL;
+    for (i = 0; i < pg->linkCount; i++) free(pg->links[i]);
+    free(pg->links);
+    pg->links = NULL;
+    pg->linkCount = pg->linkCap = 0;
+    pg->fieldCount = 0;
+    pg->formCount = 0;
+
+    renderHtmlRestore(pg, pg->html, pg->htmlLen, save, fc);
+    for (i = 0; i < pg->fieldCount; i++) {
+        int j;
+        if (strcmp(pg->fields[i].type, "radio") || !pg->fields[i].checked) continue;
+        for (j = i + 1; j < pg->fieldCount; j++)
+            if (pg->fields[j].form == pg->fields[i].form &&
+                !strcmp(pg->fields[j].type, "radio") &&
+                !strcmp(pg->fields[j].name, pg->fields[i].name))
+                pg->fields[j].checked = 0;
+    }
+    free(save);
+}
+
+static int browserOpenEx(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
+                         const char *url, const char *post, const char *referer,
+                         int record)
 {
     BrowserPage np;
     char err[200];
 
     memset(&np, 0, sizeof np);
-    if (browserFetch(&np, url, err, sizeof err) != 0) {
+    if (browserFetchEx(&np, url, post, referer, err, sizeof err) != 0) {
         safeCopy(browserError, sizeof browserError, err);
         return 0;
     }
@@ -4032,6 +4481,93 @@ static int browserOpen(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
     pageFree(pg);
     *pg = np;
     return 1;
+}
+
+static int browserOpen(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
+                       const char *url, int record)
+{
+    return browserOpenEx(pg, back, fwd, url, NULL, NULL, record);
+}
+
+/* ---- form submission ---- */
+
+static void bbUrlEncoded(BBuf *b, CURL *c, const char *s)
+{
+    char *esc = curl_easy_escape(c, s, 0);
+    if (esc) { bbPuts(b, esc); curl_free(esc); }
+}
+
+/* Submit form `formIdx`. `submitNo` is the button that was pressed (1-based
+ * field number, 0 for none). Returns 1 when a new page was loaded. */
+static int browserFormSubmit(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
+                             int formIdx, int submitNo)
+{
+    BrowserForm *form;
+    BBuf body;
+    CURL *c;
+    int i, first = 1, ok;
+
+    if (formIdx < 0 || formIdx >= pg->formCount) return 0;
+    form = &pg->forms[formIdx];
+    c = curl_easy_init();
+    if (!c) return 0;
+    bbInit(&body);
+
+    for (i = 0; i < pg->fieldCount; i++) {
+        BrowserField *f = &pg->fields[i];
+        const char *val;
+        if (f->form != formIdx || !f->name[0]) continue;
+        if (!strcmp(f->type, "submit") || !strcmp(f->type, "button") ||
+            !strcmp(f->type, "reset") || !strcmp(f->type, "image")) {
+            if (i + 1 != submitNo) continue;
+        }
+        if ((!strcmp(f->type, "checkbox") || !strcmp(f->type, "radio")) && !f->checked)
+            continue;
+        if (!strcmp(f->type, "select"))
+            val = f->optionIndex < f->optionCount ? f->optionValue[f->optionIndex] : f->value;
+        else
+            val = f->value;
+        if (!first) bbChar(&body, '&');
+        first = 0;
+        bbUrlEncoded(&body, c, f->name);
+        bbChar(&body, '=');
+        bbUrlEncoded(&body, c, val ? val : "");
+    }
+    curl_easy_cleanup(c);
+
+    if (!strcmp(form->method, "POST")) {
+        ok = browserOpenEx(pg, back, fwd, form->action, body.p ? body.p : "",
+                           pg->url, 1);
+        bbFree(&body);
+        return ok;
+    }
+    if (!body.p || body.n == 0) {
+        bbFree(&body);
+        return browserOpen(pg, back, fwd, form->action, 1);
+    }
+    {
+        size_t need = strlen(form->action) + body.n + 2;
+        char *url = (char *)malloc(need);
+        if (!url) { bbFree(&body); return 0; }
+        snprintf(url, need, "%s%s%s", form->action,
+                 strchr(form->action, '?') ? "&" : "?", body.p);
+        ok = browserOpen(pg, back, fwd, url, 1);
+        free(url);
+        bbFree(&body);
+        return ok;
+    }
+}
+
+static void browserFormReset(BrowserPage *pg, int formIdx)
+{
+    int i;
+    for (i = 0; i < pg->fieldCount; i++) {
+        BrowserField *f = &pg->fields[i];
+        if (f->form != formIdx) continue;
+        if (fieldIsText(f)) f->value[0] = '\0';
+        f->checked = 0;
+        f->optionIndex = 0;
+    }
 }
 
 static int browserBack(BrowserPage *pg, UrlStack *back, UrlStack *fwd)
@@ -4164,6 +4700,9 @@ static void browserDraw(const BrowserPage *pg, int top)
            page, pages);
     printf("  %s# link  n/p page  u url  s find  l links  b/f back/fwd  r reload  m marks  h hist  q quit%s\n",
            sty(ST_DIM), sty(ST_RESET));
+    if (pg->fieldCount)
+        printf("  %s{N} field  e <n> fill  t <n> toggle  x <n> press%s\n",
+               sty(ST_DIM), sty(ST_RESET));
 }
 
 static void browserShowLinks(const BrowserPage *pg)
@@ -4182,6 +4721,107 @@ static void browserShowLinks(const BrowserPage *pg)
         printf("  %s%3d%s  %s\n", sty(ST_ACCENT), i + 1, sty(ST_RESET), u);
     }
     if (pg->linkCount > cap) printf("\n  ... %d more not shown.\n", pg->linkCount - cap);
+}
+
+/* Handle "e <n> [text]", "t <n>" and "x <n>" for form controls. Returns 0 when
+ * the command is not one of these, 1 when the page stayed the same, 2 when a
+ * new page was loaded. */
+static int browserFieldCommand(BrowserPage *pg, UrlStack *back, UrlStack *fwd,
+                               const char *cmd)
+{
+    char work[MS_PATH_MAX];
+    char verb;
+    char *rest;
+    char *endp = NULL;
+    long no;
+    BrowserField *f;
+
+    safeCopy(work, sizeof work, cmd);
+    verb = (char)tolower((unsigned char)work[0]);
+    rest = work + 1;
+    if ((verb != 'e' && verb != 't' && verb != 'x') ||
+        (*rest && !isspace((unsigned char)*rest)))
+        return 0;
+    while (*rest && isspace((unsigned char)*rest)) rest++;
+    if (!*rest) {
+        int i;
+        if (!pg->fieldCount) {
+            browserSay(ST_WARN, "This page has no form fields.");
+            return 1;
+        }
+        browserSay(ST_DIM, "e <n> type in a field, t <n> toggle, x <n> press a button.");
+        for (i = 0; i < pg->fieldCount; i++)
+            if (strcmp(pg->fields[i].type, "hidden"))
+                browserSay(ST_RESET, "  {%d} %s (%s)", i + 1, pg->fields[i].label,
+                           pg->fields[i].type);
+        return 1;
+    }
+    no = strtol(rest, &endp, 10);
+    f = pageField(pg, (int)no);
+    if (!f) {
+        browserSay(ST_BAD, "This page has no field {%ld}.", no);
+        return 1;
+    }
+
+    if (verb == 't') {
+        if (!strcmp(f->type, "select")) {
+            if (f->optionCount > 0) f->optionIndex = (f->optionIndex + 1) % f->optionCount;
+        } else if (!strcmp(f->type, "checkbox")) {
+            f->checked = !f->checked;
+        } else if (!strcmp(f->type, "radio")) {
+            pageRadioClear(pg, f->form, f->name);
+            f->checked = 1;
+        } else {
+            browserSay(ST_WARN, "{%ld} is not a checkbox, radio button or menu.", no);
+        }
+        return 1;
+    }
+
+    if (verb == 'e') {
+        char *value = trim(endp);
+        char entered[400];
+        if (!fieldIsText(f)) {
+            browserSay(ST_WARN, "{%ld} is a %s control; press x to use it.", no, f->type);
+            return 1;
+        }
+        if (!*value) {
+            char prompt[200];
+            InStatus st;
+            snprintf(prompt, sizeof prompt, "  %s > ", f->label);
+            st = readLine(prompt, entered, sizeof entered);
+            if (st != IN_OK) return 1;
+            value = trim(entered);
+        }
+        safeCopy(f->value, sizeof f->value, value);
+        return 1;
+    }
+
+    /* x: press the control */
+    if (!strcmp(f->type, "submit") || !strcmp(f->type, "button") ||
+        !strcmp(f->type, "reset") || !strcmp(f->type, "image")) {
+        if (f->form < 0) {
+            browserSay(ST_WARN, "That button is not inside a form.");
+            return 1;
+        }
+        if (!strcmp(f->type, "reset")) {
+            browserFormReset(pg, f->form);
+            browserSay(ST_GOOD, "Form cleared.");
+            return 1;
+        }
+        if (browserFormSubmit(pg, back, fwd, f->form, (int)no)) return 2;
+        browserSay(ST_BAD, "Cannot submit: %s", browserError);
+        return 1;
+    }
+    if (!strcmp(f->type, "select")) {
+        if (f->optionCount > 0) f->optionIndex = (f->optionIndex + 1) % f->optionCount;
+        return 1;
+    }
+    if (!strcmp(f->type, "checkbox") || !strcmp(f->type, "radio")) {
+        f->checked = !f->checked;
+        return 1;
+    }
+    browserSay(ST_WARN, "{%ld} is a text field; use e %ld <value>.", no, no);
+    return 1;
 }
 
 /* ---- bookmarks and history ---- */
@@ -4438,6 +5078,7 @@ static void browserApp(void)
             appHeader("MetaDOS Browser");
             printf("\n  Type an address or search terms, then press ENTER.\n");
             printf("  Links are numbered: type a number to follow one.  q returns.\n");
+            printf("  Forms work too: e <n> fills a field, t <n> toggles, x <n> presses.\n");
             st = readLine("\n  Address > ", line, sizeof line);
             if (st == IN_EOF) break;
             if (st != IN_OK) {
@@ -4592,6 +5233,14 @@ static void browserApp(void)
                     browserSay(ST_BAD, "This page has links 1-%d, not %ld.", page.linkCount, n);
                     appBackPrompt();
                 }
+                continue;
+            }
+        }
+        {
+            int res = browserFieldCommand(&page, &back, &fwd, cmd);
+            if (res == 2) { top = 0; continue; }
+            if (res == 1) {
+                pageRefreshFields(&page);
                 continue;
             }
         }
@@ -4807,6 +5456,30 @@ static int selfTest(void)
         CHECK(pg.text && strstr(pg.text, "this [1]") && strstr(pg.text, "one") && strstr(pg.text, "two"), "browser renders links and lists");
         CHECK(!strcmp(pg.title, "Hi & bye"), "browser reads the page title");
         pageFree(&pg);
+    }
+    {
+        const char *form =
+            "<form action=\"find\" method=\"post\">"
+            "<input name=\"q\" placeholder=\"Search words\">"
+            "<input type=\"checkbox\" name=\"all\" checked>"
+            "<select name=\"n\"><option value=\"a\">A</option>"
+            "<option value=\"b\" selected>B</option></select>"
+            "<textarea name=\"t\">hello</textarea>"
+            "<input type=\"submit\" value=\"Go\"></form>";
+        BrowserPage fp;
+        memset(&fp, 0, sizeof fp);
+        safeCopy(fp.url, sizeof fp.url, "https://example.com/search?x=1");
+        renderHtml(&fp, form, strlen(form));
+        CHECK(fp.formCount == 1 && fp.fieldCount == 5, "browser collects form fields");
+        CHECK(!strcmp(fp.forms[0].method, "POST") &&
+              !strcmp(fp.forms[0].action, "https://example.com/find"),
+              "browser resolves the form action");
+        CHECK(fp.fields[1].checked && !strcmp(fp.fields[2].value, "b") &&
+              !strcmp(fp.fields[3].value, "hello"),
+              "browser reads control values");
+        CHECK(fp.text && strstr(fp.text, "Search words") && strstr(fp.text, "[Go]"),
+              "browser shows form controls");
+        pageFree(&fp);
     }
 #endif
 #undef CHECK
