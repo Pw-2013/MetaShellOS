@@ -2306,6 +2306,23 @@ static const char *archName(void)
 #endif
 }
 
+/* Machine name; gethostname() lives in Winsock on Windows, while
+ * GetComputerNameA needs no extra library, so each platform uses what it
+ * already links. */
+static void hostName(char *out, size_t n)
+{
+    if (n == 0) return;
+#ifdef _WIN32
+    {
+        DWORD sz = (DWORD)n;
+        if (!GetComputerNameA(out, &sz)) safeCopy(out, n, "unknown");
+    }
+#else
+    if (gethostname(out, n - 1) != 0) safeCopy(out, n, "unknown");
+    else out[n - 1] = '\0';
+#endif
+}
+
 /* Splits `line` in place into arguments; supports "double" and 'single' quotes. */
 static int tokenize(char *line, char **argv, int maxArgs, int *argc, char *err, size_t errSz)
 {
@@ -2799,7 +2816,10 @@ static int writeWholeFile(const char *path, const char *data, size_t n)
 static void systemMonitorApp(void)
 {
     char line[256], mem[32], totalS[32], availS[32], disk[32] = "unavailable", up[64] = "unavailable";
-    unsigned long long total = 0, avail = 0; FILE *f; struct statvfs v;
+    unsigned long long total = 0, avail = 0; FILE *f;
+#ifndef _WIN32
+    struct statvfs v;
+#endif
     for (;;) {
         appHeader("System Monitor");
         f = fopen("/proc/meminfo", "r");
@@ -2820,23 +2840,36 @@ static void taskManagerApp(void)
 {
     char b[32];
     for (;;) {
-        DIR *d; struct dirent *e; int shown = 0; appHeader("Task Manager");
+        appHeader("Task Manager");
         printf("\n  PID      PROCESS\n");
 #ifndef _WIN32
-        d = opendir("/proc"); if (d) { while ((e=readdir(d))) { char p[128], name[128] = "?"; FILE *f; int pid;
-            if (!isdigit((unsigned char)e->d_name[0])) continue; pid=atoi(e->d_name); snprintf(p,sizeof p,"/proc/%d/comm",pid); f=fopen(p,"r"); if(f){if(fgets(name,sizeof name,f)) name[strcspn(name,"\r\n")]=0; fclose(f);} printf("  %-8d %s\n",pid,name); shown++; if(shown>=80) break; } closedir(d); }
+        { DIR *d = opendir("/proc"); struct dirent *e; int shown = 0;
+          if (d) {
+            while ((e = readdir(d))) {
+              char p[128], name[128] = "?"; FILE *f; int pid;
+              if (!isdigit((unsigned char)e->d_name[0])) continue;
+              pid = atoi(e->d_name);
+              snprintf(p, sizeof p, "/proc/%d/comm", pid);
+              f = fopen(p, "r");
+              if (f) { if (fgets(name, sizeof name, f)) name[strcspn(name, "\r\n")] = 0; fclose(f); }
+              printf("  %-8d %s\n", pid, name);
+              shown++;
+              if (shown >= 80) break;
+            }
+            closedir(d);
+          } }
 #else
         printf("  Process enumeration is not available in this build.\n");
 #endif
         printf("\n  k <pid> terminate a non-critical process   r refresh   q back\n");
-        if (readLine("  > ",b,sizeof b)!=IN_OK) return; if (ciEqual(trim(b),"q")) return; if (ciEqual(trim(b),"r")) continue;
+        if (readLine("  > ",b,sizeof b)!=IN_OK) return;
+        if (ciEqual(trim(b),"q")) return;
+        if (ciEqual(trim(b),"r")) continue;
 #ifndef _WIN32
         if (b[0]=='k' && isspace((unsigned char)b[1])) { int pid=atoi(trim(b+1)); if (pid<=1 || pid==(int)getpid() || pid==(int)getppid()) { setNotice(ST_BAD,"That process is protected."); continue; } if (!confirm("Terminate the selected process?")) continue; if (kill((pid_t)pid,SIGTERM)!=0) setNotice(ST_BAD,"Terminate failed: %s",strerror(errno)); else { appLog("TASK", "terminated pid %d",pid); appNotify("Task Manager", "Process %d was terminated.",pid); setNotice(ST_GOOD,"Termination signal sent to PID %d.",pid); } }
 #endif
     }
 }
-static int writeTextFileInOs(const char *name, const char *text)
-{ FILE *f; if (!validPathArg(name) || pathIsDir(name)) return -1; f=fopen(name,"wb"); if(!f)return -1; if(fputs(text,f)==EOF || fclose(f)!=0)return -1; return 0; }
 static void textEditorProApp(void)
 {
     char name[MS_PATH_MAX], line[TERM_LINE_MAX], *buf=NULL; size_t used=0, cap=0; InStatus st; int exists;
@@ -2863,7 +2896,7 @@ static void diskManagerApp(void)
 #endif
 appBackPrompt();}
 static void systemInformationApp(void)
-{ char host[128]="unknown",cwd[MS_PATH_MAX];gethostname(host,sizeof host-1);host[sizeof host-1]='\0';MS_GETCWD(cwd,sizeof cwd);appHeader("System Information");printf("\n  OS: %s\n  Version: %s\n  Architecture: %s\n  Host name: %s\n  User: %s\n  Working directory: %s\n  Compiler: %s\n",MS_NAME,MS_VERSION,archName(),host,os.user,cwd, __VERSION__);appBackPrompt();}
+{ char host[128]="unknown",cwd[MS_PATH_MAX];hostName(host,sizeof host);MS_GETCWD(cwd,sizeof cwd);appHeader("System Information");printf("\n  OS: %s\n  Version: %s\n  Architecture: %s\n  Host name: %s\n  User: %s\n  Working directory: %s\n  Compiler: %s\n",MS_NAME,MS_VERSION,archName(),host,os.user,cwd, __VERSION__);appBackPrompt();}
 static void networkManagerApp(void)
 { appHeader("Network Manager");printf("\n  Interfaces:\n");
 #ifndef _WIN32
