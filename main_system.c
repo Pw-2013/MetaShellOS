@@ -37,6 +37,14 @@
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+/* The browser is part of every build: when libcurl headers are installed it
+ * is enabled automatically, so a plain `gcc main_system.c` produces the full
+ * program without extra -D flags. Define NO_CURL to leave it out. */
+#if !defined(HAVE_CURL) && !defined(NO_CURL) && defined(__has_include)
+#  if __has_include(<curl/curl.h>)
+#    define HAVE_CURL 1
+#  endif
+#endif
 #ifdef HAVE_CURL
 #include <curl/curl.h>
 #endif
